@@ -28,7 +28,6 @@ Python scripts must be run within the uv environment:
 - **Option 2**: Activate environment first with `source .venv/bin/activate`, then run normally
 
 ## Key Dependencies
-- `transformers==4.56.0` — pinned, this is the version that works for loading the Ouro pretrained model
 - `torch==2.9.0` — pinned, cu128
 - `flash-attn` — for efficient attention
 
