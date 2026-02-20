@@ -66,7 +66,11 @@ class GRPOConfig:
 
     # GRPO
     clip_eps: float = 0.2
-    kl_coeff: float = 1e-3
+    kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
+    scale_rewards: str = "group"  # "group" (mean+std per group), "none" (no std), "batch" (group mean, batch std)
+    num_iterations: int = 1  # μ: number of policy updates per generation batch
+    mask_truncated_completions: bool = True  # Zero out loss for completions that didn't terminate with EOS
+    token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
     max_new_tokens: int = 2048
@@ -230,7 +234,7 @@ def tokenize_prompt_response_pairs(
 
 def train_step(
     policy_model: AutoModelForCausalLM,
-    ref_model: AutoModelForCausalLM,
+    ref_model: AutoModelForCausalLM | None,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     tokenized: dict[str, torch.Tensor],
@@ -238,6 +242,8 @@ def train_step(
     config: GRPOConfig,
 ) -> dict[str, float]:
     """Single GRPO gradient update with micro-batching.
+
+    When config.kl_coeff == 0, ref_model can be None and ref log-probs are skipped.
 
     Returns aggregated metrics dict.
     """
@@ -250,14 +256,17 @@ def train_step(
 
     batch_size = input_ids.shape[0]
 
-    # Compute reference log-probs (no grad, micro-batched).
-    ref_log_probs = compute_log_probs_batch(
-        ref_model,
-        input_ids,
-        attention_mask,
-        response_start_indices,
-        micro_batch_size=config.log_prob_micro_batch,
-    )
+    # Compute reference log-probs only when KL is enabled.
+    ref_log_probs = None
+    if config.kl_coeff > 0:
+        assert ref_model is not None, "ref_model required when kl_coeff > 0"
+        ref_log_probs = compute_log_probs_batch(
+            ref_model,
+            input_ids,
+            attention_mask,
+            response_start_indices,
+            micro_batch_size=config.log_prob_micro_batch,
+        )
 
     # Compute old log-probs (from current policy, no grad — these are the "old" policy for this step).
     old_log_probs = compute_log_probs_batch(
@@ -287,12 +296,13 @@ def train_step(
 
         loss, metrics = grpo_loss(
             policy_log_probs=policy_lp,
-            ref_log_probs=ref_log_probs[mb_slice],
             old_log_probs=old_log_probs[mb_slice],
             advantages=advantages[mb_slice],
             response_mask=response_mask[mb_slice],
             clip_eps=config.clip_eps,
             kl_coeff=config.kl_coeff,
+            ref_log_probs=ref_log_probs[mb_slice] if ref_log_probs is not None else None,
+            token_level_loss=config.token_level_loss,
         )
 
         # Scale loss by number of micro-batches for correct gradient averaging.
@@ -369,17 +379,21 @@ def main(config: GRPOConfig) -> None:
     patch_ouro_post_load(policy_model, tokenizer)
     policy_model.train()
 
-    logger.info("Loading reference model: %s", config.model_name)
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        trust_remote_code=True,
-        torch_dtype=torch_dtype,
-        device_map="cuda",
-    )
-    patch_ouro_post_load(ref_model, tokenizer)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad = False
+    ref_model = None
+    if config.kl_coeff > 0:
+        logger.info("Loading reference model: %s", config.model_name)
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map="cuda",
+        )
+        patch_ouro_post_load(ref_model, tokenizer)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+    else:
+        logger.info("KL disabled (kl_coeff=0) — skipping reference model")
 
     # Optimizer + scheduler.
     optimizer = torch.optim.AdamW(
@@ -417,7 +431,8 @@ def main(config: GRPOConfig) -> None:
 
         # Move training models to CPU to free GPU memory for vLLM.
         policy_model.cpu()
-        ref_model.cpu()
+        if ref_model is not None:
+            ref_model.cpu()
         torch.cuda.empty_cache()
 
         gen_start = time.time()
@@ -434,7 +449,8 @@ def main(config: GRPOConfig) -> None:
         # Move training models back to GPU.
         device = torch.device("cuda")
         policy_model.to(device)
-        ref_model.to(device)
+        if ref_model is not None:
+            ref_model.to(device)
 
         # --- 3. Score rollouts ---
         rewards_list: list[list[float]] = []
@@ -448,9 +464,10 @@ def main(config: GRPOConfig) -> None:
         rewards = torch.tensor(rewards_list, dtype=torch.float32)  # (num_prompts, rollouts)
         mean_reward = rewards.mean().item()
         fraction_correct = (rewards > 0).float().mean().item()
+        frac_reward_zero_std = (rewards.std(dim=1) == 0).float().mean().item()
 
         # --- 4. Compute advantages ---
-        advantages = compute_advantages(rewards)  # (num_prompts, rollouts)
+        advantages = compute_advantages(rewards, scale_rewards=config.scale_rewards)  # (num_prompts, rollouts)
 
         # Skip step if all advantages are zero (no learning signal).
         if (advantages == 0).all():
@@ -481,26 +498,49 @@ def main(config: GRPOConfig) -> None:
         max_length = config.max_model_len
         tokenized = tokenize_prompt_response_pairs(tokenizer, flat_prompts, flat_responses, max_length)
 
-        # --- 6. GRPO update ---
+        # --- 5b. Mask truncated completions (no EOS → no learning signal) ---
+        clipped_ratio = 0.0
+        if config.mask_truncated_completions:
+            eos_id = tokenizer.eos_token_id
+            n_truncated = 0
+            for i in range(tokenized["input_ids"].shape[0]):
+                last_real_idx = tokenized["attention_mask"][i].sum().item() - 1
+                if tokenized["input_ids"][i, last_real_idx].item() != eos_id:
+                    tokenized["response_mask"][i] = 0.0
+                    n_truncated += 1
+            clipped_ratio = n_truncated / tokenized["input_ids"].shape[0]
+
+        # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
-        metrics = train_step(
-            policy_model,
-            ref_model,
-            optimizer,
-            scheduler,
-            tokenized,
-            flat_advantages,
-            config,
-        )
+        for _iteration in range(config.num_iterations):
+            metrics = train_step(
+                policy_model,
+                ref_model,
+                optimizer,
+                scheduler,
+                tokenized,
+                flat_advantages,
+                config,
+            )
         train_time = time.time() - train_start
 
         step_time = time.time() - step_start
 
         # --- 7. Logging ---
+        completion_lengths = [len(tokenizer.encode(r, add_special_tokens=False)) for r in flat_responses]
+        mean_completion_len = sum(completion_lengths) / len(completion_lengths)
+        max_completion_len = max(completion_lengths)
+        min_completion_len = min(completion_lengths)
+
         log_data = {
             "step": step,
             "reward/mean": mean_reward,
             "reward/fraction_correct": fraction_correct,
+            "reward/frac_zero_std": frac_reward_zero_std,
+            "completions/mean_length": mean_completion_len,
+            "completions/max_length": max_completion_len,
+            "completions/min_length": min_completion_len,
+            "completions/clipped_ratio": clipped_ratio,
             "time/step_total": step_time,
             "time/generation": gen_time,
             "time/training": train_time,
@@ -508,15 +548,20 @@ def main(config: GRPOConfig) -> None:
         }
 
         if step % config.log_every == 0:
+            kl_str = f" kl={metrics['kl']:.4f}" if "kl" in metrics else ""
             logger.info(
-                "[Step %d/%d] reward=%.3f correct=%.1f%% surr=%.4f kl=%.4f ratio=%.3f gen=%.1fs train=%.1fs",
+                "[Step %d/%d] reward=%.3f correct=%.1f%% len=%.0f surr=%.4f%s"
+                " ratio=%.3f clip=%.3f trunc=%.1f%% gen=%.1fs train=%.1fs",
                 step,
                 config.num_steps,
                 mean_reward,
                 fraction_correct * 100,
+                mean_completion_len,
                 metrics.get("surrogate_loss", 0),
-                metrics.get("kl", 0),
+                kl_str,
                 metrics.get("mean_ratio", 1),
+                metrics.get("clip_ratio", 0),
+                clipped_ratio * 100,
                 gen_time,
                 train_time,
             )
@@ -561,7 +606,10 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--rollouts-per-prompt", type=int, default=8)
     p.add_argument("--grad-accumulation-steps", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--kl-coeff", type=float, default=1e-3)
+    p.add_argument("--kl-coeff", type=float, default=0.0)
+    p.add_argument("--scale-rewards", default="group", choices=["group", "none", "batch"])
+    p.add_argument("--num-iterations", type=int, default=1)
+    p.add_argument("--no-mask-truncated", dest="mask_truncated_completions", action="store_false")
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--temperature", type=float, default=0.7)

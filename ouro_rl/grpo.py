@@ -8,20 +8,32 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 
-def compute_advantages(rewards: torch.Tensor) -> torch.Tensor:
+def compute_advantages(rewards: torch.Tensor, scale_rewards: str = "group") -> torch.Tensor:
     """Group-relative advantage normalization.
 
     Args:
         rewards: (num_prompts, rollouts_per_prompt) binary rewards.
+        scale_rewards: Normalization strategy:
+            "group" — subtract group mean, divide by group std (original GRPO).
+            "none"  — subtract group mean only; avoids question-level difficulty bias
+                       (Understanding R1-Zero-Like Training, arXiv:2503.20783).
+            "batch" — subtract group mean, divide by *batch* std; more robust shaping
+                       (Tricks or Traps? arXiv:2508.08221).
 
     Returns:
-        advantages: same shape, zero-mean unit-variance within each prompt group.
-            Groups with zero variance (all same reward) get zero advantage.
+        advantages: same shape, normalized within each prompt group.
+            When scale_rewards="group", groups with zero std get zero advantage.
     """
     mean = rewards.mean(dim=1, keepdim=True)
-    std = rewards.std(dim=1, keepdim=True)
-    advantages = torch.where(std > 0, (rewards - mean) / (std + 1e-8), torch.zeros_like(rewards))
-    return advantages
+
+    if scale_rewards == "none":
+        return rewards - mean
+    elif scale_rewards == "batch":
+        batch_std = rewards.std()
+        return torch.where(batch_std > 0, (rewards - mean) / (batch_std + 1e-8), torch.zeros_like(rewards))
+    else:  # "group" (default, original behavior)
+        std = rewards.std(dim=1, keepdim=True)
+        return torch.where(std > 0, (rewards - mean) / (std + 1e-8), torch.zeros_like(rewards))
 
 
 @torch.no_grad()
@@ -107,22 +119,33 @@ def compute_log_probs_with_grad(
 
 def grpo_loss(
     policy_log_probs: torch.Tensor,
-    ref_log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     clip_eps: float = 0.2,
-    kl_coeff: float = 1e-3,
+    kl_coeff: float = 0.0,
+    ref_log_probs: torch.Tensor | None = None,
+    token_level_loss: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute GRPO clipped surrogate loss with KL penalty.
+    """Compute GRPO clipped surrogate loss with optional KL penalty.
 
     All log-prob tensors are (batch, seq_len) with zeros at non-response positions.
     advantages is (batch,) — one scalar per sequence.
     response_mask is (batch, seq_len) — 1.0 for response tokens.
 
+    When kl_coeff=0 (default), the KL term is skipped entirely and ref_log_probs
+    is not required. This follows DAPO / Open-Reasoner-Zero / R1-Zero findings
+    that KL regularization is unnecessary with verifiable rewards.
+
+    Args:
+        token_level_loss: If True (default), average over all response tokens across
+            the batch (TRL default, avoids response-level length bias per
+            arXiv:2503.20783). If False, average per-sequence then over batch
+            (original GRPO formulation).
+
     Returns:
         loss: scalar, the GRPO objective to minimize.
-        metrics: dict with surrogate_loss, kl, mean_ratio for logging.
+        metrics: dict with surrogate_loss, mean_ratio, clip_ratio, and optionally kl.
     """
     # Per-token policy ratio in log-space.
     log_ratio = policy_log_probs - old_log_probs  # (batch, seq_len)
@@ -136,21 +159,39 @@ def grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     token_surrogate = torch.min(surr1, surr2)
 
-    # Average over response tokens per sequence, then over batch.
-    response_lengths = response_mask.sum(dim=1).clamp(min=1)
-    seq_surrogate = (token_surrogate * response_mask).sum(dim=1) / response_lengths
-    surrogate_loss = -seq_surrogate.mean()
+    total_response_tokens = response_mask.sum().clamp(min=1)
 
-    # Per-token KL divergence (policy vs reference), averaged same way.
-    token_kl = policy_log_probs - ref_log_probs
-    seq_kl = (token_kl * response_mask).sum(dim=1) / response_lengths
-    kl = seq_kl.mean()
+    if token_level_loss:
+        # TRL default: flat average over all response tokens (avoids length bias).
+        surrogate_loss = -(token_surrogate * response_mask).sum() / total_response_tokens
+    else:
+        # Original GRPO: per-sequence average then batch average.
+        response_lengths = response_mask.sum(dim=1).clamp(min=1)
+        seq_surrogate = (token_surrogate * response_mask).sum(dim=1) / response_lengths
+        surrogate_loss = -seq_surrogate.mean()
 
-    loss = surrogate_loss + kl_coeff * kl
+    loss = surrogate_loss
 
-    metrics = {
+    # Clip ratio: fraction of response tokens where the ratio was clipped.
+    is_clipped = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)) & response_mask.bool()
+    clip_ratio = is_clipped.sum().float() / total_response_tokens
+
+    metrics: dict[str, float] = {
         "surrogate_loss": surrogate_loss.item(),
-        "kl": kl.item(),
         "mean_ratio": ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0,
+        "clip_ratio": clip_ratio.item(),
     }
+
+    # Optional KL penalty (policy vs reference).
+    if kl_coeff > 0:
+        assert ref_log_probs is not None, "ref_log_probs required when kl_coeff > 0"
+        token_kl = policy_log_probs - ref_log_probs
+        if token_level_loss:
+            kl = (token_kl * response_mask).sum() / total_response_tokens
+        else:
+            response_lengths = response_mask.sum(dim=1).clamp(min=1)
+            kl = ((token_kl * response_mask).sum(dim=1) / response_lengths).mean()
+        loss = loss + kl_coeff * kl
+        metrics["kl"] = kl.item()
+
     return loss, metrics
