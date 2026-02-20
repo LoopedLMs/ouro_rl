@@ -34,6 +34,13 @@ Python scripts must be run within the uv environment:
 ## Debugging
 Check `.venv` source code directly for library implementation details
 
+## Background Knowledge
+Paper summaries and research notes live in `./knowledge/`. Check there for context on relevant prior work (e.g. layer redundancy, recurrence retrofitting). The paper behind this repository is summarized in knowledge/summary_retrofitting_recurrence.md.
+
+## Ouro-Thinking Model Quirks (Huggingface)
+- **Wrong bos/eos upstream**: Both 1.4B and 2.6B Thinking models ship with bos/eos/pad all set to `<|endoftext|>` (id=0). Correct: bos=`<|im_start|>` (1), eos=`<|im_end|>` (2).
+- **enable_thinking**: Ouro-Thinking won't emit `<think>` on its own — it must be prepended in the prompt. Upstream chat template lacks `enable_thinking` support. We use a local template at `templates/ouro_chat.j2` that appends `<think>\n` after `<|im_start|>assistant\n` when `enable_thinking=True`.
+
 ## Research Stack
-- Framework: PyTorch + HuggingFace Transformers
+- Framework: PyTorch + HuggingFace Transformers + vLLM
 - Testing: pytest for core components only (skip for exploratory code)
