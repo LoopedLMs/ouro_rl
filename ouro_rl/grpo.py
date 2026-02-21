@@ -119,7 +119,7 @@ def compute_log_probs_with_grad(
 
 def grpo_loss(
     policy_log_probs: torch.Tensor,
-    old_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor | None,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     clip_eps: float = 0.2,
@@ -132,6 +132,9 @@ def grpo_loss(
     All log-prob tensors are (batch, seq_len) with zeros at non-response positions.
     advantages is (batch,) — one scalar per sequence.
     response_mask is (batch, seq_len) — 1.0 for response tokens.
+
+    When old_log_probs is None (num_iterations == 1), the ratio is 1.0 everywhere
+    and clipping is skipped — equivalent to vanilla policy gradient.
 
     When kl_coeff=0 (default), the KL term is skipped entirely and ref_log_probs
     is not required. This follows DAPO / Open-Reasoner-Zero / R1-Zero findings
@@ -147,17 +150,22 @@ def grpo_loss(
         loss: scalar, the GRPO objective to minimize.
         metrics: dict with surrogate_loss, mean_ratio, clip_ratio, and optionally kl.
     """
-    # Per-token policy ratio in log-space.
-    log_ratio = policy_log_probs - old_log_probs  # (batch, seq_len)
+    adv = advantages.unsqueeze(1)  # (batch,) → (batch, 1) for broadcasting
 
-    # Per-token ratio (clamped for numerical stability).
-    ratio = torch.exp(log_ratio.clamp(-10, 10))
+    if old_log_probs is not None:
+        # Per-token policy ratio in log-space.
+        log_ratio = policy_log_probs - old_log_probs  # (batch, seq_len)
+        ratio = torch.exp(log_ratio.clamp(-10, 10))
 
-    # Per-token clipped surrogate.  advantages is (batch,) → (batch, 1) for broadcasting.
-    adv = advantages.unsqueeze(1)
-    surr1 = ratio * adv
-    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-    token_surrogate = torch.min(surr1, surr2)
+        # Clipped surrogate.
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+        token_surrogate = torch.min(surr1, surr2)
+    else:
+        # num_iterations=1 → old == policy, so ratio is exactly 1.0 and clipping is a no-op.
+        # Skip the redundant forward pass but keep the same loss semantics as PPO branch.
+        ratio = None
+        token_surrogate = adv
 
     total_response_tokens = response_mask.sum().clamp(min=1)
 
@@ -172,15 +180,15 @@ def grpo_loss(
 
     loss = surrogate_loss
 
-    # Clip ratio: fraction of response tokens where the ratio was clipped.
-    is_clipped = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)) & response_mask.bool()
-    clip_ratio = is_clipped.sum().float() / total_response_tokens
+    metrics: dict[str, float] = {"surrogate_loss": surrogate_loss.item()}
 
-    metrics: dict[str, float] = {
-        "surrogate_loss": surrogate_loss.item(),
-        "mean_ratio": ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0,
-        "clip_ratio": clip_ratio.item(),
-    }
+    if ratio is not None:
+        is_clipped = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)) & response_mask.bool()
+        metrics["mean_ratio"] = ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0
+        metrics["clip_ratio"] = is_clipped.sum().float().item() / total_response_tokens.item()
+    else:
+        metrics["mean_ratio"] = 1.0
+        metrics["clip_ratio"] = 0.0
 
     # Optional KL penalty (policy vs reference).
     if kl_coeff > 0:

@@ -4,8 +4,8 @@ Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
 
 Usage:
     uv run python grpo_train.py
-    uv run python grpo_train.py --smoke-test          # 3 steps, small batch
-    uv run python grpo_train.py --num-steps 140       # full training run
+    uv run python grpo_train.py --smoke-test --no-wandb # 3 steps, small batch
+    uv run python grpo_train.py --num-steps 140         # full training run
 
 Architecture:
     - vLLM: generates rollouts (created/destroyed each step to free GPU memory)
@@ -18,6 +18,7 @@ import gc
 import json
 import logging
 import random
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,24 +42,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GRPOConfig:
-    """Hyperparameters matching RLTT paper Table 6 (scaled for 1.4B on 2×A100)."""
+    """Hyperparameters matching RLTT paper Table 6 (scaled for 1.4B on 2xA100)."""
 
     # Model
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
-    max_model_len: int = 4096  # vLLM context window
+    max_model_len: int = 4096  # vLLM context window (covers all prompts + 2048 generation)
 
     # Dataset
     dataset_name: str = "qwedsacf/competition_math"
-    system_prompt: str = (
-        "You are a helpful assistant. Solve the following math problem step by step. Put your final answer within \\boxed{}."
-    )
+    system_prompt: str | None = None  # None = no system prompt (see ouro_rl/data.py for alternatives)
 
     # Training
     num_steps: int = 140
-    prompt_batch_size: int = 16
+    prompt_batch_size: int = 32
     rollouts_per_prompt: int = 8
-    grad_accumulation_steps: int = 4
     lr: float = 1e-6
     max_grad_norm: float = 0.1
     warmup_steps: int = 14  # 10% of 140
@@ -67,7 +65,7 @@ class GRPOConfig:
     # GRPO
     clip_eps: float = 0.2
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
-    scale_rewards: str = "group"  # "group" (mean+std per group), "none" (no std), "batch" (group mean, batch std)
+    scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
     num_iterations: int = 1  # μ: number of policy updates per generation batch
     mask_truncated_completions: bool = True  # Zero out loss for completions that didn't terminate with EOS
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
@@ -86,6 +84,7 @@ class GRPOConfig:
     output_dir: str = "outputs/grpo"
     log_every: int = 1
     save_every: int = 10
+    keep_last_n_checkpoints: int = 2  # Delete older checkpoints to save disk (0 = keep all)
     wandb_project: str = "ouro-rl"
     wandb_enabled: bool = True
 
@@ -97,20 +96,14 @@ class GRPOConfig:
             self.num_steps = 3
             self.prompt_batch_size = 4
             self.rollouts_per_prompt = 4
-            self.grad_accumulation_steps = 1
             self.save_every = 1
-            self.wandb_enabled = False
             self.max_new_tokens = 256
-            self.max_model_len = 2048
+            self.max_model_len = 1024
 
     # Derived
     @property
     def total_rollouts_per_step(self) -> int:
         return self.prompt_batch_size * self.rollouts_per_prompt
-
-    @property
-    def effective_batch_size(self) -> int:
-        return self.total_rollouts_per_step * self.grad_accumulation_steps
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +114,6 @@ class GRPOConfig:
 def generate_rollouts(
     model_path: str,
     prompts: list[str],
-    rollouts_per_prompt: int,
     sampling_params: SamplingParams,
     *,
     dtype: str = "bfloat16",
@@ -131,34 +123,26 @@ def generate_rollouts(
     """Generate multiple rollouts per prompt using vLLM.
 
     Creates a vLLM LLM instance, generates, then destroys it to free GPU memory.
+    Number of rollouts per prompt is controlled by sampling_params.n.
 
     Returns:
         List of lists: outer=prompts, inner=rollouts per prompt.
     """
-    # Expand prompts: each prompt repeated rollouts_per_prompt times.
-    expanded_prompts = [p for p in prompts for _ in range(rollouts_per_prompt)]
-
     llm = LLM(
         model=model_path,
         trust_remote_code=trust_remote_code,
         dtype=dtype,
         max_model_len=max_model_len,
-        gpu_memory_utilization=0.5,  # Leave room for training models later.
         enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
     )
-    outputs = llm.generate(expanded_prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params)
 
     # Clean up vLLM completely.
     del llm
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Reshape: (num_prompts * rollouts_per_prompt,) → (num_prompts, rollouts_per_prompt)
-    results: list[list[str]] = []
-    for i in range(0, len(outputs), rollouts_per_prompt):
-        group = [outputs[i + j].outputs[0].text for j in range(rollouts_per_prompt)]
-        results.append(group)
-    return results
+    return [[out.text for out in output.outputs] for output in outputs]
 
 
 # ---------------------------------------------------------------------------
@@ -268,14 +252,18 @@ def train_step(
             micro_batch_size=config.log_prob_micro_batch,
         )
 
-    # Compute old log-probs (from current policy, no grad — these are the "old" policy for this step).
-    old_log_probs = compute_log_probs_batch(
-        policy_model,
-        input_ids,
-        attention_mask,
-        response_start_indices,
-        micro_batch_size=config.log_prob_micro_batch,
-    )
+    # Compute old log-probs only when num_iterations > 1 (the frozen snapshot anchors the
+    # clipping ratio across multiple optimization passes over the same rollouts).
+    # With num_iterations == 1, old == policy so ratio is always 1.0 and clipping is a no-op.
+    old_log_probs = None
+    if config.num_iterations > 1:
+        old_log_probs = compute_log_probs_batch(
+            policy_model,
+            input_ids,
+            attention_mask,
+            response_start_indices,
+            micro_batch_size=config.log_prob_micro_batch,
+        )
 
     # Micro-batched forward/backward for policy gradient.
     optimizer.zero_grad()
@@ -296,7 +284,7 @@ def train_step(
 
         loss, metrics = grpo_loss(
             policy_log_probs=policy_lp,
-            old_log_probs=old_log_probs[mb_slice],
+            old_log_probs=old_log_probs[mb_slice] if old_log_probs is not None else None,
             advantages=advantages[mb_slice],
             response_mask=response_mask[mb_slice],
             clip_eps=config.clip_eps,
@@ -358,6 +346,7 @@ def main(config: GRPOConfig) -> None:
 
     # vLLM sampling params.
     sampling_params = SamplingParams(
+        n=config.rollouts_per_prompt,
         temperature=config.temperature,
         top_p=config.top_p,
         max_tokens=config.max_new_tokens,
@@ -439,7 +428,6 @@ def main(config: GRPOConfig) -> None:
         rollout_texts = generate_rollouts(
             current_model_path,
             prompts,
-            config.rollouts_per_prompt,
             sampling_params,
             dtype=config.dtype,
             max_model_len=config.max_model_len,
@@ -493,22 +481,45 @@ def main(config: GRPOConfig) -> None:
         flat_responses = [
             rollout_texts[i][j] for i in range(config.prompt_batch_size) for j in range(config.rollouts_per_prompt)
         ]
+        all_responses = list(flat_responses)  # Defensive copy for length stats before filtering.
 
-        # --- 5. Tokenize ---
-        max_length = config.max_model_len
-        tokenized = tokenize_prompt_response_pairs(tokenizer, flat_prompts, flat_responses, max_length)
-
-        # --- 5b. Mask truncated completions (no EOS → no learning signal) ---
+        # --- 5. Filter truncated completions (no EOS → no learning signal) ---
+        # Drop them before tokenization to avoid wasting compute on zero-gradient sequences.
         clipped_ratio = 0.0
         if config.mask_truncated_completions:
-            eos_id = tokenizer.eos_token_id
-            n_truncated = 0
-            for i in range(tokenized["input_ids"].shape[0]):
-                last_real_idx = tokenized["attention_mask"][i].sum().item() - 1
-                if tokenized["input_ids"][i, last_real_idx].item() != eos_id:
-                    tokenized["response_mask"][i] = 0.0
-                    n_truncated += 1
-            clipped_ratio = n_truncated / tokenized["input_ids"].shape[0]
+            eos_token = tokenizer.eos_token
+            keep = [r.endswith(eos_token) for r in flat_responses]
+            n_total = len(flat_responses)
+            n_truncated = n_total - sum(keep)
+            clipped_ratio = n_truncated / n_total
+
+            if n_truncated > 0 and n_truncated < n_total:
+                flat_prompts = [p for p, k in zip(flat_prompts, keep) if k]
+                flat_responses = [r for r, k in zip(flat_responses, keep) if k]
+                flat_advantages = flat_advantages[torch.tensor(keep)]
+            elif n_truncated == n_total:
+                logger.info(
+                    "[Step %d/%d] All completions truncated, skipping update.",
+                    step,
+                    config.num_steps,
+                )
+                if config.wandb_enabled:
+                    import wandb
+
+                    wandb.log(
+                        {
+                            "step": step,
+                            "reward/mean": mean_reward,
+                            "reward/fraction_correct": fraction_correct,
+                            "completions/clipped_ratio": 1.0,
+                            "skipped": True,
+                        }
+                    )
+                continue
+
+        # --- 5b. Tokenize ---
+        max_length = config.max_model_len
+        tokenized = tokenize_prompt_response_pairs(tokenizer, flat_prompts, flat_responses, max_length)
 
         # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
@@ -527,7 +538,7 @@ def main(config: GRPOConfig) -> None:
         step_time = time.time() - step_start
 
         # --- 7. Logging ---
-        completion_lengths = [len(tokenizer.encode(r, add_special_tokens=False)) for r in flat_responses]
+        completion_lengths = [len(tokenizer.encode(r, add_special_tokens=False)) for r in all_responses]
         mean_completion_len = sum(completion_lengths) / len(completion_lengths)
         max_completion_len = max(completion_lengths)
         min_completion_len = min(completion_lengths)
@@ -580,6 +591,14 @@ def main(config: GRPOConfig) -> None:
             # Update model path for vLLM to load from checkpoint next step.
             current_model_path = str(ckpt_dir)
 
+            # Delete old checkpoints to save disk space.
+            if config.keep_last_n_checkpoints > 0:
+                existing = sorted(output_dir.glob("step_*"))
+                to_delete = existing[: -config.keep_last_n_checkpoints]
+                for old_ckpt in to_delete:
+                    logger.info("Deleting old checkpoint: %s", old_ckpt)
+                    shutil.rmtree(old_ckpt)
+
     # Final save.
     final_dir = output_dir / "final"
     policy_model.save_pretrained(final_dir)
@@ -599,24 +618,23 @@ def main(config: GRPOConfig) -> None:
 
 def parse_args() -> GRPOConfig:
     p = argparse.ArgumentParser(description="GRPO training for Ouro")
-    p.add_argument("--model", dest="model_name", default="ByteDance/Ouro-1.4B-Thinking")
-    p.add_argument("--dataset", dest="dataset_name", default="qwedsacf/competition_math")
-    p.add_argument("--num-steps", type=int, default=140)
-    p.add_argument("--prompt-batch-size", type=int, default=16)
-    p.add_argument("--rollouts-per-prompt", type=int, default=8)
-    p.add_argument("--grad-accumulation-steps", type=int, default=4)
-    p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--kl-coeff", type=float, default=0.0)
-    p.add_argument("--scale-rewards", default="group", choices=["group", "none", "batch"])
-    p.add_argument("--num-iterations", type=int, default=1)
-    p.add_argument("--no-mask-truncated", dest="mask_truncated_completions", action="store_false")
-    p.add_argument("--max-new-tokens", type=int, default=2048)
-    p.add_argument("--max-model-len", type=int, default=4096)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--output-dir", default="outputs/grpo")
-    p.add_argument("--save-every", type=int, default=10)
-    p.add_argument("--smoke-test", action="store_true")
-    p.add_argument("--no-wandb", dest="wandb_enabled", action="store_false")
+    p.add_argument("--model", dest="model_name")
+    p.add_argument("--dataset", dest="dataset_name")
+    p.add_argument("--num-steps", type=int)
+    p.add_argument("--prompt-batch-size", type=int)
+    p.add_argument("--rollouts-per-prompt", type=int)
+    p.add_argument("--lr", type=float)
+    p.add_argument("--kl-coeff", type=float)
+    p.add_argument("--scale-rewards", choices=["batch", "group", "none"])
+    p.add_argument("--num-iterations", type=int)
+    p.add_argument("--mask-truncated", dest="mask_truncated_completions", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--max-new-tokens", type=int)
+    p.add_argument("--max-model-len", type=int)
+    p.add_argument("--temperature", type=float)
+    p.add_argument("--output-dir")
+    p.add_argument("--save-every", type=int)
+    p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--wandb", dest="wandb_enabled", action=argparse.BooleanOptionalAction, default=None)
     args = p.parse_args()
     return GRPOConfig(**{k: v for k, v in vars(args).items() if v is not None})
 
