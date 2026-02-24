@@ -470,6 +470,7 @@ def main(config: GRPOConfig) -> None:
         torch_dtype=torch_dtype,
         device_map="cuda",
     )
+    policy_model.enable_fp32_lm_head()
     policy_model.train()
 
     ref_model = None
@@ -480,6 +481,7 @@ def main(config: GRPOConfig) -> None:
             torch_dtype=torch_dtype,
             device_map="cuda",
         )
+        ref_model.enable_fp32_lm_head()
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False

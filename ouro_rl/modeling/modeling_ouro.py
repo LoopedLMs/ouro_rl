@@ -560,6 +560,34 @@ class OuroModel(OuroPreTrainedModel):
         )
 
 
+class _FP32LMHead(nn.Module):
+    """Wraps a linear lm_head to perform the matmul in fp32.
+
+    Weights stay in their original dtype (bf16); hidden states and weights are
+    upcast to fp32 only for the matmul (ScaleRL / MiniMax approach).
+    Exposes .weight and .bias so that save_pretrained / tied-weights still work.
+    """
+
+    def __init__(self, original: nn.Linear) -> None:
+        super().__init__()
+        self.original = original
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.original.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.original.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(
+            x.float(),
+            self.original.weight.float(),
+            self.original.bias.float() if self.original.bias is not None else None,
+        )
+
+
 class OuroForCausalLM(OuroPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -578,6 +606,14 @@ class OuroForCausalLM(OuroPreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def enable_fp32_lm_head(self) -> None:
+        """Wrap lm_head to compute the final matmul in fp32 (ScaleRL fix).
+
+        Weights remain bf16; only the matmul is upcast. Call after from_pretrained().
+        """
+        if not isinstance(self.lm_head, _FP32LMHead):
+            self.lm_head = _FP32LMHead(self.lm_head)
 
     def set_decoder(self, decoder):
         self.model = decoder

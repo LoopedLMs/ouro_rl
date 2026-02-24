@@ -20,29 +20,12 @@ import json
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from ouro_rl.data import format_prompt
 from ouro_rl.modeling import CHAT_TEMPLATE, EOS_TOKEN_ID, PAD_TOKEN_ID, OuroForCausalLM
-
-
-class FP32LMHead(nn.Module):
-    """Wraps a linear lm_head to perform the matmul in fp32.
-
-    Weights stay in their original dtype (bf16); hidden states and weights are
-    upcast to fp32 only for the matmul (ScaleRL / MiniMax fix).
-    """
-
-    def __init__(self, original: nn.Linear) -> None:
-        super().__init__()
-        self.original = original
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias = self.original.bias
-        return F.linear(x.float(), self.original.weight.float(), bias.float() if bias is not None else None)
 
 
 def _patch_vllm_fp32_lm_head() -> None:
@@ -165,7 +148,7 @@ def main() -> None:
     model.eval()
 
     if args.fp32_lm_head:
-        model.lm_head = FP32LMHead(model.lm_head)
+        model.enable_fp32_lm_head()
         print("  -> LM head matmul upcast to fp32")
 
     device = next(model.parameters()).device
