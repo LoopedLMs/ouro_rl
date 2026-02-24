@@ -1,11 +1,9 @@
 """MATH dataset loading and prompt formatting for GRPO training."""
 
-from pathlib import Path
-
 from datasets import Dataset, load_dataset
 from transformers import PreTrainedTokenizerBase
 
-CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_chat.j2").read_text()
+from ouro_rl.modeling import CHAT_TEMPLATE
 
 # System prompt for math reasoning.
 #

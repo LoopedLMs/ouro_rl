@@ -24,12 +24,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from ouro_rl.data import CHAT_TEMPLATE, INTERRUPTION_PHRASE, format_prompt, load_math_train
+from ouro_rl.data import INTERRUPTION_PHRASE, format_prompt, load_math_train
 from ouro_rl.grpo import cispo_loss, compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
-from ouro_rl.patches import CORRECT_EOS_TOKEN_ID, patch_ouro, patch_ouro_post_load
+from ouro_rl.modeling import CHAT_TEMPLATE, EOS_TOKEN_ID, OuroForCausalLM
 from ouro_rl.reward import score_answer
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,7 @@ class GRPOConfig:
     save_every: int = 10
     keep_last_n_checkpoints: int = 2  # Delete older checkpoints to save disk (0 = keep all)
     wandb_project: str = "ouro-rl"
+    wandb_run_name: str | None = None
     wandb_enabled: bool = True
 
     # Reproducibility
@@ -303,8 +304,8 @@ def pad_token_id_pairs(
 
 
 def train_step(
-    policy_model: AutoModelForCausalLM,
-    ref_model: AutoModelForCausalLM | None,
+    policy_model: OuroForCausalLM,
+    ref_model: OuroForCausalLM | None,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     tokenized: dict[str, torch.Tensor],
@@ -425,14 +426,13 @@ def main(config: GRPOConfig) -> None:
     if config.wandb_enabled:
         import wandb
 
-        wandb.init(project=config.wandb_project, config=config.__dict__)
+        wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=config.__dict__)
 
-    # Apply pre-load patches.
-    patch_ouro()
-
-    # Load tokenizer.
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
-    # Load chat template.
+    # Load tokenizer with fixed token IDs and chat template.
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.bos_token_id = 1  # <|im_start|>
+    tokenizer.eos_token_id = 2  # <|im_end|>
+    tokenizer.pad_token_id = 0  # <|endoftext|>
     tokenizer.chat_template = CHAT_TEMPLATE
 
     # Load dataset.
@@ -452,7 +452,7 @@ def main(config: GRPOConfig) -> None:
         temperature=config.temperature,
         top_p=config.top_p,
         max_tokens=config.max_new_tokens,
-        stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+        stop_token_ids=[EOS_TOKEN_ID],
         skip_special_tokens=False,  # Keep <think>...</think> for reward parsing.
     )
 
@@ -462,25 +462,21 @@ def main(config: GRPOConfig) -> None:
     # Load policy + reference models for training.
     torch_dtype = getattr(torch, config.dtype)
     logger.info("Loading policy model: %s", config.model_name)
-    policy_model = AutoModelForCausalLM.from_pretrained(
+    policy_model = OuroForCausalLM.from_pretrained(
         config.model_name,
-        trust_remote_code=True,
         torch_dtype=torch_dtype,
         device_map="cuda",
     )
-    patch_ouro_post_load(policy_model, tokenizer)
     policy_model.train()
 
     ref_model = None
     if config.kl_coeff > 0:
         logger.info("Loading reference model: %s", config.model_name)
-        ref_model = AutoModelForCausalLM.from_pretrained(
+        ref_model = OuroForCausalLM.from_pretrained(
             config.model_name,
-            trust_remote_code=True,
             torch_dtype=torch_dtype,
             device_map="cuda",
         )
-        patch_ouro_post_load(ref_model, tokenizer)
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False
@@ -546,7 +542,7 @@ def main(config: GRPOConfig) -> None:
                 temperature=config.temperature,
                 top_p=config.top_p,
                 max_tokens=thinking_budget,
-                stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                stop_token_ids=[EOS_TOKEN_ID],
                 skip_special_tokens=False,
             )
 
@@ -557,7 +553,7 @@ def main(config: GRPOConfig) -> None:
             think_close_id = tokenizer.convert_tokens_to_ids("</think>")
             interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
 
-            needs_interruption = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+            needs_interruption = find_truncated_completions(rollout_response_ids, EOS_TOKEN_ID, think_close_id)
             n_interrupted = len(needs_interruption)
 
             if n_interrupted > 0:
@@ -572,7 +568,7 @@ def main(config: GRPOConfig) -> None:
                     temperature=config.temperature,
                     top_p=config.top_p,
                     max_tokens=config.answer_budget,
-                    stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                    stop_token_ids=[EOS_TOKEN_ID],
                     skip_special_tokens=False,
                 )
                 phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
@@ -607,10 +603,7 @@ def main(config: GRPOConfig) -> None:
         max_completion_len = max(all_response_lengths)
         min_completion_len = min(all_response_lengths)
         clipped_ratio = sum(
-            1
-            for prompt_rollouts in rollout_response_ids
-            for ids in prompt_rollouts
-            if not ids or ids[-1] != CORRECT_EOS_TOKEN_ID
+            1 for prompt_rollouts in rollout_response_ids for ids in prompt_rollouts if not ids or ids[-1] != EOS_TOKEN_ID
         ) / len(all_response_lengths)
         completion_log_data: dict[str, float] = {
             "completions/mean_length": mean_completion_len,
@@ -700,7 +693,7 @@ def main(config: GRPOConfig) -> None:
         kept_reward_mean = mean_reward
         kept_fraction_correct = fraction_correct
         if config.mask_truncated_completions:
-            keep = [r[-1] == CORRECT_EOS_TOKEN_ID if r else False for r in flat_response_ids]
+            keep = [r[-1] == EOS_TOKEN_ID if r else False for r in flat_response_ids]
             n_total = len(flat_response_ids)
             n_truncated = n_total - sum(keep)
 
@@ -869,6 +862,7 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--save-every", type=int)
     p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--wandb", dest="wandb_enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--wandb-run-name", dest="wandb_run_name")
     p.add_argument("--seed", type=int)
     args = p.parse_args()
     return GRPOConfig(**{k: v for k, v in vars(args).items() if v is not None})

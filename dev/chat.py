@@ -7,12 +7,11 @@ Run with the vLLM environment:
 
 import argparse
 import sys
-from pathlib import Path
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_chat.j2").read_text()
+from ouro_rl.modeling import CHAT_TEMPLATE
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,7 +81,7 @@ def main() -> None:
     show_thinking = args.show_thinking
 
     print(f"Loading {args.model} with vLLM...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     llm = LLM(
         model=args.model,
         trust_remote_code=True,

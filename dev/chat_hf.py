@@ -7,12 +7,11 @@ Run with:
 
 import argparse
 import sys
-from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
-CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_chat.j2").read_text()
+from ouro_rl.modeling import CHAT_TEMPLATE, OuroForCausalLM
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +41,7 @@ def split_thinking(text: str) -> tuple[str | None, str]:
 
 
 def generate(
-    model: AutoModelForCausalLM,
+    model: OuroForCausalLM,
     tokenizer: AutoTokenizer,
     messages: list[dict[str, str]],
     *,
@@ -89,10 +88,10 @@ def main() -> None:
     show_thinking = args.show_thinking
 
     print(f"Loading {args.model} with transformers...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.chat_template = CHAT_TEMPLATE
+    model = OuroForCausalLM.from_pretrained(
         args.model,
-        trust_remote_code=True,
         dtype=torch.bfloat16,
         device_map="auto",
     )

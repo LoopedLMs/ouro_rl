@@ -12,6 +12,7 @@ frozen anchor for multi-iteration GRPO.
 Usage:
     uv run python dev/compare_logprobs_vllm_hf.py
     uv run python dev/compare_logprobs_vllm_hf.py --model ByteDance/Ouro-1.4B-Thinking
+    uv run python dev/compare_logprobs_vllm_hf.py --fp32-lm-head
 """
 
 import argparse
@@ -19,12 +20,55 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from ouro_rl.data import format_prompt
-from ouro_rl.patches import patch_ouro_post_load
+from ouro_rl.modeling import CHAT_TEMPLATE, EOS_TOKEN_ID, PAD_TOKEN_ID, OuroForCausalLM
+
+
+class FP32LMHead(nn.Module):
+    """Wraps a linear lm_head to perform the matmul in fp32.
+
+    Weights stay in their original dtype (bf16); hidden states and weights are
+    upcast to fp32 only for the matmul (ScaleRL / MiniMax fix).
+    """
+
+    def __init__(self, original: nn.Linear) -> None:
+        super().__init__()
+        self.original = original
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.original.bias
+        return F.linear(x.float(), self.original.weight.float(), bias.float() if bias is not None else None)
+
+
+def _patch_vllm_fp32_lm_head() -> None:
+    """Monkey-patch vLLM's LogitsProcessor to upcast hidden states to fp32.
+
+    Works because vLLM uses fork() on Linux — the patched method is inherited
+    by the engine subprocess. The bf16 lm_head weight is auto-promoted to fp32
+    by PyTorch's F.linear when the input is fp32.
+    """
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
+        # Bypass quant_method.apply — do the matmul directly in fp32.
+        logits = F.linear(
+            hidden_states.float(),
+            lm_head.weight.float(),
+            embedding_bias.float() if embedding_bias is not None else None,
+        )
+        logits = self._gather_logits(logits)
+        if logits is not None:
+            logits = logits[..., : self.org_vocab_size]
+        return logits
+
+    LogitsProcessor._get_logits = _fp32_get_logits
+    print("  -> Patched vLLM LogitsProcessor for fp32 lm_head matmul")
+
 
 PROBLEMS = [
     "What is 7 * 8?",
@@ -41,14 +85,26 @@ def main() -> None:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-model-len", type=int, default=2816)
     p.add_argument("--output", type=str, default=None, help="Save results to JSON file")
+    p.add_argument(
+        "--fp32-lm-head",
+        action="store_true",
+        help="Upcast hidden states & lm_head weight to fp32 for the final matmul (ScaleRL fix)",
+    )
     args = p.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.bos_token_id = 1
+    tokenizer.eos_token_id = EOS_TOKEN_ID
+    tokenizer.pad_token_id = PAD_TOKEN_ID
+    tokenizer.chat_template = CHAT_TEMPLATE
 
     # --- Step 1: Generate with vLLM and capture log-probs ---
     print("=" * 70)
     print("Step 1: Generating with vLLM (capturing per-token log-probs)")
     print("=" * 70)
+
+    if args.fp32_lm_head:
+        _patch_vllm_fp32_lm_head()
 
     prompts = [format_prompt(prob, tokenizer) for prob in PROBLEMS]
 
@@ -100,15 +156,17 @@ def main() -> None:
     print("Step 2: Recomputing log-probs with HF Transformers")
     print("=" * 70)
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = OuroForCausalLM.from_pretrained(
         args.model,
-        trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="flash_attention_2",
     )
     model.eval()
-    patch_ouro_post_load(model, tokenizer)
+
+    if args.fp32_lm_head:
+        model.lm_head = FP32LMHead(model.lm_head)
+        print("  -> LM head matmul upcast to fp32")
 
     device = next(model.parameters()).device
 

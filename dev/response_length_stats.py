@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from ouro_rl.data import CHAT_TEMPLATE, format_prompt, load_math_train
-from ouro_rl.patches import CORRECT_EOS_TOKEN_ID, patch_ouro
+from ouro_rl.modeling import EOS_TOKEN_ID
 from ouro_rl.reward import score_answer
 
 
@@ -66,11 +66,8 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-load patches.
-    patch_ouro()
-
     # Load tokenizer.
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.chat_template = CHAT_TEMPLATE
 
     # Load dataset.
@@ -110,7 +107,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_new_tokens,
-        stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+        stop_token_ids=[EOS_TOKEN_ID],
         skip_special_tokens=False,
     )
 
@@ -151,7 +148,7 @@ def main() -> None:
         for resp in output.outputs:
             resp_len = len(resp.token_ids)
             resp_ids = list(resp.token_ids)
-            completed = resp_ids[-1] == CORRECT_EOS_TOKEN_ID if resp_ids else False
+            completed = resp_ids[-1] == EOS_TOKEN_ID if resp_ids else False
             text = tokenizer.decode(resp_ids)
             correct = score_answer(text, sampled_solutions[prompt_idx]) == 1.0
 

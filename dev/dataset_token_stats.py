@@ -47,7 +47,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load tokenizer.
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.chat_template = CHAT_TEMPLATE
 
     # Load dataset.

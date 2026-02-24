@@ -29,17 +29,20 @@ Python scripts must be run within the uv environment:
 ## Debugging
 Check `.venv` source code directly for library implementation details
 
-## Ouro-Thinking Model Quirks (Huggingface)
-- **Wrong bos/eos upstream**: Both 1.4B and 2.6B Thinking models ship with bos/eos/pad all set to `<|endoftext|>` (id=0). Correct: bos=`<|im_start|>` (1), eos=`<|im_end|>` (2).
-- **enable_thinking**: Ouro-Thinking won't emit `<think>` on its own — it must be prepended in the prompt. Upstream chat template lacks `enable_thinking` support. We use a local template at `templates/ouro_chat.j2` that appends `<think>\n` after `<|im_start|>assistant\n` when `enable_thinking=True`.
+## Ouro Model (`ouro_rl/modeling/`)
+We ship a local copy of the Ouro model with upstream bugs fixed:
+- **`OuroForCausalLM`** — local model class with fixed `UniversalTransformerCache.get_mask_sizes` (upstream returns wrong kv_length during autoregressive steps, corrupting batched generation)
+- **Token IDs** (`ouro_rl.modeling.constants`): Upstream ships bos/eos/pad all set to `<|endoftext|>` (id=0). Correct: `BOS_TOKEN_ID=1` (`<|im_start|>`), `EOS_TOKEN_ID=2` (`<|im_end|>`), `PAD_TOKEN_ID=0`. Constants module is torch-free for safe import in vLLM workers.
+- **Chat template**: `ouro_rl/modeling/chat_template.jinja` — supports `enable_thinking=True` to prepend `<think>\n` after `assistant\n`
+- **vLLM**: Uses upstream Ouro (trust_remote_code) for generation only — no local model fixes needed since vLLM doesn't use HF's cache. We pass `stop_token_ids=[EOS_TOKEN_ID]` and `skip_tokenizer_init=True` to work around wrong upstream token IDs.
 
 ## Project Structure
-- `ouro_rl/` — core library (training, model patches, data)
+- `ouro_rl/modeling/` — local Ouro model, config, constants, chat template
+- `ouro_rl/` — core library (training, data, rewards)
 - `eval/` — lm-eval tasks, configs, and analysis scripts
 - `scripts/` — standalone utilities
 - `tests/` — pytest suite
 - `knowledge/` — paper summaries and research notes
-- `templates/` — chat templates (Jinja2)
 - `dev/` — exploratory / throwaway scripts
 
 ## Research Stack

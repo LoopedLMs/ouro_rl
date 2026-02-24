@@ -5,13 +5,13 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 
-from ouro_rl.patches import CORRECT_BOS_TOKEN_ID, CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID
+from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
 from scripts.grpo_train import generate_rollouts, pad_token_id_pairs
 
 # Realistic ChatML token IDs for Ouro-Thinking.
 # <|im_start|>=1, <|im_end|>=2, <|endoftext|>=0, <think>=151648, </think>=151649
-IM_START = CORRECT_BOS_TOKEN_ID  # 1
-IM_END = CORRECT_EOS_TOKEN_ID  # 2
+IM_START = BOS_TOKEN_ID  # 1
+IM_END = EOS_TOKEN_ID  # 2
 PAD = PAD_TOKEN_ID  # 0
 THINK_OPEN = 151648
 THINK_CLOSE = 151649

@@ -5,22 +5,14 @@ This script generates responses individually and in a batch, then compares them
 to see if shorter prompts get corrupted by padding.
 
 Run HF test:
-    uv run python examples/test_batched_generation.py --backend hf
+    uv run python dev/test_batched_generation.py --backend hf  --attn-impl eager
 Run vLLM test:
-    uv run python examples/test_batched_generation.py --backend vllm
-Run both:
-    uv run python examples/test_batched_generation.py --backend both
+    uv run python dev/test_batched_generation.py --backend vllm
 """
 
 import argparse
-from pathlib import Path
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from ouro_rl.patches import CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID, patch_ouro_post_load
-
-CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_chat.j2").read_text()
+from ouro_rl.modeling.constants import CHAT_TEMPLATE, EOS_TOKEN_ID, PAD_TOKEN_ID
 
 # Prompts of deliberately different lengths to expose padding issues.
 # Ordered short -> long so prompt[0] is most likely to be corrupted if
@@ -50,8 +42,13 @@ def strip_thinking(text: str) -> str:
 
 
 def truncate_at_eos(text: str) -> str:
-    """Truncate at first EOS token so trailing padding doesn't pollute comparison."""
-    return text
+    """Truncate at first EOS token and strip padding artifacts."""
+    eos_idx = text.find("<|im_end|>")
+    if eos_idx != -1:
+        text = text[:eos_idx]
+    # Strip any leaked pad tokens (<|endoftext|>)
+    text = text.replace("<|endoftext|>", "")
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -60,23 +57,29 @@ def truncate_at_eos(text: str) -> str:
 
 
 def test_hf(model_name: str, max_new_tokens: int, attn_impl: str) -> None:
+    import torch
+    from transformers import AutoTokenizer
+
+    from ouro_rl.modeling import OuroForCausalLM
+
     print("=" * 70)
     print(f"HF TRANSFORMERS — BATCHED GENERATION TEST (attn={attn_impl})")
     print("=" * 70)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.bos_token_id = 1
+    tokenizer.eos_token_id = EOS_TOKEN_ID
+    tokenizer.pad_token_id = PAD_TOKEN_ID
+    tokenizer.chat_template = CHAT_TEMPLATE
+    tokenizer.padding_side = "left"
+
+    model = OuroForCausalLM.from_pretrained(
         model_name,
-        trust_remote_code=True,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )
     model.eval()
-
-    # Apply patches: fix token IDs + UniversalTransformerCache.get_mask_sizes
-    patch_ouro_post_load(model, tokenizer)
-    tokenizer.padding_side = "left"
 
     # --- individual generation (reference) ---
     print("\n--- Individual generation (reference) ---")
@@ -100,7 +103,7 @@ def test_hf(model_name: str, max_new_tokens: int, attn_impl: str) -> None:
                 temperature=0.6,
                 top_p=0.95,
                 do_sample=False,  # greedy for reproducibility
-                eos_token_id=CORRECT_EOS_TOKEN_ID,
+                eos_token_id=EOS_TOKEN_ID,
                 pad_token_id=PAD_TOKEN_ID,
             )
 
@@ -145,7 +148,7 @@ def test_hf(model_name: str, max_new_tokens: int, attn_impl: str) -> None:
             temperature=0.6,
             top_p=0.95,
             do_sample=False,  # greedy for reproducibility
-            eos_token_id=CORRECT_EOS_TOKEN_ID,
+            eos_token_id=EOS_TOKEN_ID,
             pad_token_id=PAD_TOKEN_ID,
         )
 
@@ -177,13 +180,14 @@ def test_hf(model_name: str, max_new_tokens: int, attn_impl: str) -> None:
 
 
 def test_vllm(model_name: str, max_new_tokens: int) -> None:
+    from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
     print("=" * 70)
     print("vLLM — BATCHED GENERATION TEST")
     print("=" * 70)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     llm = LLM(
         model=model_name,
         trust_remote_code=True,

@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 from vllm import SamplingParams
 
 from ouro_rl.data import CHAT_TEMPLATE, INTERRUPTION_PHRASE, format_prompt
-from ouro_rl.patches import CORRECT_BOS_TOKEN_ID, CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID, patch_ouro
+from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
 from scripts.grpo_train import (
     create_vllm,
     destroy_vllm,
@@ -30,11 +30,10 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 
 @pytest.fixture(scope="module")
 def tokenizer() -> AutoTokenizer:
-    patch_ouro()
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     tok.chat_template = CHAT_TEMPLATE
-    tok.bos_token_id = CORRECT_BOS_TOKEN_ID
-    tok.eos_token_id = CORRECT_EOS_TOKEN_ID
+    tok.bos_token_id = BOS_TOKEN_ID
+    tok.eos_token_id = EOS_TOKEN_ID
     tok.pad_token_id = PAD_TOKEN_ID
     return tok
 
@@ -53,7 +52,7 @@ def rollout_results(tokenizer):
         n=2,
         temperature=0.7,
         max_tokens=MAX_NEW_TOKENS,
-        stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+        stop_token_ids=[EOS_TOKEN_ID],
         skip_special_tokens=False,
     )
     response_ids = generate_rollouts(
@@ -95,8 +94,8 @@ class TestGenerateRolloutsIntegration:
         think_token_id = tokenizer.convert_tokens_to_ids("<think>")
 
         for i, ids in enumerate(prompt_ids):
-            assert CORRECT_BOS_TOKEN_ID in ids, f"Prompt {i}: missing <|im_start|>"
-            assert CORRECT_EOS_TOKEN_ID in ids, f"Prompt {i}: missing <|im_end|>"
+            assert BOS_TOKEN_ID in ids, f"Prompt {i}: missing <|im_start|>"
+            assert EOS_TOKEN_ID in ids, f"Prompt {i}: missing <|im_end|>"
             assert think_token_id in ids, f"Prompt {i}: missing <think>"
             # <think> should be near the end — template appends "<think>\n" after "assistant\n".
             think_pos = ids.index(think_token_id)
@@ -175,7 +174,7 @@ class TestInterruptionFlowIntegration:
             n=n_rollouts,
             temperature=0.7,
             max_tokens=THINKING_BUDGET,
-            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            stop_token_ids=[EOS_TOKEN_ID],
             skip_special_tokens=False,
         )
 
@@ -191,7 +190,7 @@ class TestInterruptionFlowIntegration:
                 assert len(resp_ids) <= THINKING_BUDGET
 
         # Detect truncated completions.
-        needs_interruption = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+        needs_interruption = find_truncated_completions(rollout_response_ids, EOS_TOKEN_ID, think_close_id)
         # With 16-token budget, expect most/all to be truncated.
         assert len(needs_interruption) > 0, "Expected at least some truncated completions with tiny budget"
 
@@ -206,7 +205,7 @@ class TestInterruptionFlowIntegration:
             n=1,
             temperature=0.7,
             max_tokens=ANSWER_BUDGET,
-            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            stop_token_ids=[EOS_TOKEN_ID],
             skip_special_tokens=False,
         )
         phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
@@ -250,14 +249,14 @@ class TestInterruptionFlowIntegration:
             n=1,
             temperature=0.7,
             max_tokens=THINKING_BUDGET,
-            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            stop_token_ids=[EOS_TOKEN_ID],
             skip_special_tokens=False,
         )
 
         llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
         rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
 
-        needs = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+        needs = find_truncated_completions(rollout_response_ids, EOS_TOKEN_ID, think_close_id)
 
         if needs:
             phase2_prompt_ids = [
@@ -267,7 +266,7 @@ class TestInterruptionFlowIntegration:
                 n=1,
                 temperature=0.7,
                 max_tokens=ANSWER_BUDGET,
-                stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                stop_token_ids=[EOS_TOKEN_ID],
                 skip_special_tokens=False,
             )
             phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
