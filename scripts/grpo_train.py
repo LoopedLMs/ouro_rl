@@ -337,6 +337,7 @@ def train_step(
             attention_mask,
             response_start_indices,
             micro_batch_size=config.log_prob_micro_batch,
+            use_early_exit_gate=False,
         )
 
     # Compute old log-probs only when num_iterations > 1 (the frozen snapshot anchors the
@@ -350,6 +351,7 @@ def train_step(
             attention_mask,
             response_start_indices,
             micro_batch_size=config.log_prob_micro_batch,
+            use_early_exit_gate=False,
         )
 
     # Micro-batched forward/backward for policy gradient.
@@ -367,6 +369,7 @@ def train_step(
             input_ids[mb_slice],
             attention_mask[mb_slice],
             response_start_indices[mb_slice],
+            use_early_exit_gate=False,
         )
 
         loss_kwargs = {

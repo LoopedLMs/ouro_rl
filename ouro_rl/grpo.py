@@ -45,6 +45,7 @@ def compute_log_probs_batch(
     attention_mask: torch.Tensor,
     response_start_indices: torch.Tensor,
     micro_batch_size: int = 4,
+    **model_kwargs,
 ) -> torch.Tensor:
     """Compute per-token log-probs for response tokens only.
 
@@ -56,6 +57,7 @@ def compute_log_probs_batch(
         attention_mask: (batch, seq_len).
         response_start_indices: (batch,) index where response tokens begin.
         micro_batch_size: Forward pass batch size.
+        **model_kwargs: Extra kwargs forwarded to model.forward().
 
     Returns:
         token_log_probs: (batch, seq_len) with zeros for prompt positions.
@@ -68,7 +70,7 @@ def compute_log_probs_batch(
         mb_ids = input_ids[start:end]
         mb_mask = attention_mask[start:end]
 
-        outputs = model(input_ids=mb_ids, attention_mask=mb_mask)
+        outputs = model(input_ids=mb_ids, attention_mask=mb_mask, **model_kwargs)
         logits = outputs.logits  # (mb, seq_len, vocab)
 
         # Shift: logits[t] predicts token[t+1]
@@ -93,12 +95,13 @@ def compute_log_probs_with_grad(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     response_start_indices: torch.Tensor,
+    **model_kwargs,
 ) -> torch.Tensor:
     """Same as compute_log_probs_batch but retains gradients for policy training.
 
     Processes entire batch at once (caller handles micro-batching).
     """
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
     logits = outputs.logits
 
     shift_logits = logits[:, :-1, :]

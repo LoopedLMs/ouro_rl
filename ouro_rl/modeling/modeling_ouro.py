@@ -472,6 +472,7 @@ class OuroModel(OuroPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
+        use_early_exit_gate: bool = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -527,8 +528,8 @@ class OuroModel(OuroPreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        hidden_states_list = []
-        gate_list = []
+        hidden_states_list: list[torch.Tensor] = []
+        gate_list: list[torch.Tensor] = []
 
         for current_ut in range(self.total_ut_steps):
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -545,8 +546,9 @@ class OuroModel(OuroPreTrainedModel):
                 )
 
             hidden_states = self.norm(hidden_states)
-            hidden_states_list.append(hidden_states)
-            gate_list.append(self.early_exit_gate(hidden_states))
+            if use_early_exit_gate:
+                hidden_states_list.append(hidden_states)
+                gate_list.append(self.early_exit_gate(hidden_states))
 
         return (
             BaseModelOutputWithPast(
@@ -595,6 +597,7 @@ class OuroForCausalLM(OuroPreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        use_early_exit_gate: bool = True,
         use_weighted_exit: bool | None = False,  # 控制是否使用加权 early exit
         exit_at_step: int | None = None,
         exit_threshold: float | None = None,
@@ -636,6 +639,7 @@ class OuroForCausalLM(OuroPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            use_early_exit_gate=use_early_exit_gate,
             **kwargs,
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

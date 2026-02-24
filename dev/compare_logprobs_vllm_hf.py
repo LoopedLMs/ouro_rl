@@ -183,7 +183,7 @@ def main() -> None:
 
         # Forward pass through HF model (no grad).
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_early_exit_gate=False)
             logits = outputs.logits  # (1, seq_len, vocab)
 
         # Compute per-token log-probs (shifted: logits[t] predicts token[t+1]).
