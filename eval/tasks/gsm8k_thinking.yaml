@@ -1,12 +1,12 @@
 # GSM8K for thinking models (zero-shot, \boxed{} answer format).
 # Scoring: math-verify symbolic comparison (inherited from _math_base.yaml).
-# Use with: --apply_chat_template --system_instruction "..." --include_path eval/tasks
+# Use with: --apply_chat_template --include_path eval/tasks
 include: _math_base.yaml
 task: gsm8k_thinking
 dataset_path: openai/gsm8k
 dataset_name: main
 test_split: test
-doc_to_text: "{{question}}"
+doc_to_text: "{{question}}\n\nPut your final answer in \\boxed{}."
 doc_to_target: "{{answer.split('####')[-1].strip()}}"
 metadata:
   version: 1.0
