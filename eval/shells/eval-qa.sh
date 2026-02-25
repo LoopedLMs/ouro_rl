@@ -8,11 +8,10 @@
 set -euo pipefail
 source "$(dirname "$0")/eval-common.sh"
 
-SYSTEM_INSTRUCTION="Answer the multiple choice question. Output only the correct option letter, e.g. (C). No explanation."
 TASKS="${TASKS:-gpqa_main_thinking}"
 
 echo "Model:          $MODEL"
 echo "Tasks:          $TASKS"
 echo ""
 
-run_all "$TASKS" --system_instruction "$SYSTEM_INSTRUCTION"
+run_all "$TASKS"

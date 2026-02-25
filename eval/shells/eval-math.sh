@@ -10,11 +10,10 @@
 set -euo pipefail
 source "$(dirname "$0")/eval-common.sh"
 
-SYSTEM_INSTRUCTION="Solve the math problem. Put your final answer in \\boxed{}."
 TASKS="${TASKS:-gsm8k_thinking,math500_thinking,aime24_thinking}"
 
 echo "Model:          $MODEL"
 echo "Tasks:          $TASKS"
 echo ""
 
-run_all "$TASKS" --system_instruction "$SYSTEM_INSTRUCTION"
+run_all "$TASKS"
