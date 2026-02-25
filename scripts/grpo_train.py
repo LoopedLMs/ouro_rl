@@ -141,6 +141,7 @@ def create_vllm(
     dtype: str = "bfloat16",
     max_model_len: int = 4096,
     trust_remote_code: bool = True,
+    seed: int = 0,
 ) -> LLM:
     """Create a vLLM LLM instance for generation.
 
@@ -167,6 +168,7 @@ def create_vllm(
         max_model_len=max_model_len,
         enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
         skip_tokenizer_init=True,
+        seed=seed,
         **kwargs,
     )
 
@@ -614,7 +616,7 @@ def main(config: GRPOConfig) -> None:
                 skip_special_tokens=False,
             )
 
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len)
+            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, seed=config.seed)
             my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, phase1_params)
 
             # Identify truncated completions on this rank's subset.
@@ -662,7 +664,7 @@ def main(config: GRPOConfig) -> None:
                     config.total_rollouts_per_step,
                 )
         else:
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len)
+            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, seed=config.seed)
             my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, sampling_params)
             destroy_vllm(llm)
             del llm
