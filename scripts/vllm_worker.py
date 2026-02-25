@@ -3,10 +3,10 @@
 Process exit guarantees all GPU memory is freed (no leak).
 Communicates with the parent via torch.save/torch.load on temp .pt files.
 
-The parent sets up a single-rank distributed env (MASTER_ADDR, MASTER_PORT,
-RANK=0, WORLD_SIZE=1) so this worker can init torch.distributed and create
-vLLM with external_launcher — vLLM's supported way to avoid spawning its
-own EngineCore subprocess.
+The parent strips torchrun distributed env vars and sets CUDA_VISIBLE_DEVICES
+to a single GPU, so this worker runs as a plain single-GPU vLLM process.
+VLLM_ENABLE_V1_MULTIPROCESSING=0 keeps the EngineCore in-process (no
+subprocess spawning).
 
 Usage (called by run_vllm_generation in grpo_train.py, not directly):
     python scripts/vllm_worker.py <request.pt> <response.pt>
@@ -16,19 +16,15 @@ import os
 import sys
 import traceback
 
-# Keep EngineCore in-process (belt-and-suspenders alongside external_launcher).
+# Keep EngineCore in-process — prevents vLLM V1 from spawning a separate process.
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 
 def main(request_path: str, response_path: str) -> None:
     import torch
-    import torch.distributed as dist
     from vllm import LLM, SamplingParams
 
     try:
-        # Init single-rank process group (parent set MASTER_ADDR/PORT/RANK/WORLD_SIZE).
-        dist.init_process_group(backend="nccl")
-
         request = torch.load(request_path, weights_only=False)
 
         llm = LLM(
@@ -39,7 +35,6 @@ def main(request_path: str, response_path: str) -> None:
             enforce_eager=True,
             skip_tokenizer_init=True,
             seed=request["seed"],
-            distributed_executor_backend="external_launcher",
         )
 
         # Phase 1: generate rollouts.
@@ -115,9 +110,6 @@ def main(request_path: str, response_path: str) -> None:
         }
 
     torch.save(response, response_path)
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

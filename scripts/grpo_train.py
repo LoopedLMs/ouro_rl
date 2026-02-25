@@ -22,7 +22,6 @@ import logging
 import os
 import random
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -205,9 +204,11 @@ def run_vllm_generation(
     try:
         torch.save(request, request_path)
 
-        # Build a clean env: strip parent's torchrun vars, then provide a fresh
-        # single-rank distributed context so the worker can init torch.distributed
-        # and create vLLM with external_launcher (vLLM's supported approach).
+        # Build a clean env: strip parent's torchrun distributed vars so the
+        # subprocess runs as a plain single-GPU vLLM process (no distributed
+        # context, no external_launcher).  CUDA_VISIBLE_DEVICES restricts to
+        # one GPU and VLLM_ENABLE_V1_MULTIPROCESSING=0 keeps the EngineCore
+        # in-process (no vLLM subprocess spawning).
         _STRIP_VARS = {
             "RANK",
             "WORLD_SIZE",
@@ -219,18 +220,9 @@ def run_vllm_generation(
             "TORCHELASTIC_RESTART_COUNT",
             "TORCHELASTIC_MAX_RESTARTS",
             "TORCHELASTIC_RUN_ID",
+            "TORCHELASTIC_USE_AGENT_STORE",
         }
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_VARS}
-        # Single-rank distributed context for the worker.
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            free_port = s.getsockname()[1]
-        env["MASTER_ADDR"] = "127.0.0.1"
-        env["MASTER_PORT"] = str(free_port)
-        env["RANK"] = "0"
-        env["WORLD_SIZE"] = "1"
-        env["LOCAL_RANK"] = "0"
-        env["LOCAL_WORLD_SIZE"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env["VLLM_HOST_IP"] = "127.0.0.1"
