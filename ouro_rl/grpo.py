@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
+from ouro_rl.packing import PackedBatch
+
 
 def compute_advantages(
     rewards: torch.Tensor,
@@ -127,6 +129,127 @@ def compute_log_probs_with_grad(
     masked_lp = token_lp * response_mask
     # Pad to full seq_len (prepend a zero column) for consistent indexing.
     return F.pad(masked_lp, (1, 0), value=0.0)
+
+
+def _extract_response_log_probs(
+    logits: torch.Tensor,
+    row_ids: torch.Tensor,
+    packed: PackedBatch,
+    row_idx: int,
+) -> list[tuple[int, torch.Tensor]]:
+    """Extract per-sequence response log-probs from a packed row's logits.
+
+    Args:
+        logits: (1, row_len, vocab) from model forward on one packed row.
+        row_ids: (1, row_len) token IDs for this packed row.
+        packed: PackedBatch with sequence metadata.
+        row_idx: Which row we're extracting from.
+
+    Returns:
+        List of (seq_idx, response_log_probs_1d) pairs for sequences in this row.
+    """
+    # Shift: logits[t] predicts token[t+1].
+    shift_logits = logits[0, :-1, :]  # (row_len-1, vocab)
+    shift_labels = row_ids[0, 1:]  # (row_len-1,)
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    all_token_lp = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)  # (row_len-1,)
+
+    results: list[tuple[int, torch.Tensor]] = []
+    for info in packed.seq_infos:
+        if info.row_idx != row_idx:
+            continue
+        # In the shifted view, response log-probs start at resp_offset - 1.
+        resp_start_shifted = max(info.resp_offset - 1, 0)
+        resp_end_shifted = info.offset + info.total_len - 1  # last token's log-prob
+        results.append((info.seq_idx, all_token_lp[resp_start_shifted:resp_end_shifted]))
+
+    return results
+
+
+def _collect_to_padded(
+    per_seq: list[tuple[int, torch.Tensor]],
+    num_sequences: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collect variable-length per-sequence tensors into right-padded (N, max_len) output.
+
+    Returns:
+        log_probs: (num_sequences, max_resp_len) right-padded with zeros.
+        response_mask: (num_sequences, max_resp_len) 1.0 for real tokens.
+    """
+    max_resp_len = max(t.shape[0] for _, t in per_seq) if per_seq else 1
+    log_probs = torch.zeros(num_sequences, max_resp_len, device=device)
+    response_mask = torch.zeros(num_sequences, max_resp_len, device=device)
+
+    for seq_idx, lp in per_seq:
+        length = lp.shape[0]
+        log_probs[seq_idx, :length] = lp
+        response_mask[seq_idx, :length] = 1.0
+
+    return log_probs, response_mask
+
+
+@torch.no_grad()
+def compute_log_probs_packed(
+    model: PreTrainedModel,
+    packed: PackedBatch,
+    **model_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute response log-probs using packed forward passes (no gradients).
+
+    Processes one packed row at a time (batch_size=1). FlashAttention detects
+    packing from position_ids and uses varlen for block-diagonal attention.
+
+    Args:
+        model: HF causal LM with attn_implementation="flash_attention_2".
+        packed: PackedBatch from pack_sequences().
+        **model_kwargs: Extra kwargs forwarded to model.forward().
+
+    Returns:
+        log_probs: (num_sequences, max_resp_len) right-padded response log-probs.
+        response_mask: (num_sequences, max_resp_len) 1.0 for real response tokens.
+    """
+    device = next(model.parameters()).device
+    all_per_seq: list[tuple[int, torch.Tensor]] = []
+
+    for row_idx in range(packed.num_rows):
+        row_ids = packed.row_ids[row_idx].unsqueeze(0).to(device)  # (1, row_len)
+        pos_ids = packed.row_position_ids[row_idx].unsqueeze(0).to(device)  # (1, row_len)
+
+        outputs = model(
+            input_ids=row_ids,
+            attention_mask=None,
+            position_ids=pos_ids,
+            **model_kwargs,
+        )
+        per_seq = _extract_response_log_probs(outputs.logits, row_ids, packed, row_idx)
+        all_per_seq.extend(per_seq)
+
+    return _collect_to_padded(all_per_seq, packed.num_sequences, device)
+
+
+def forward_packed_row_with_grad(
+    model: PreTrainedModel,
+    packed: PackedBatch,
+    row_idx: int,
+    **model_kwargs,
+) -> list[tuple[int, torch.Tensor]]:
+    """Forward one packed row with gradients; extract per-sequence response log-probs.
+
+    Returns list of (seq_idx, response_log_probs_1d) with gradients retained.
+    Caller handles loss computation and backward.
+    """
+    device = next(model.parameters()).device
+    row_ids = packed.row_ids[row_idx].unsqueeze(0).to(device)
+    pos_ids = packed.row_position_ids[row_idx].unsqueeze(0).to(device)
+
+    outputs = model(
+        input_ids=row_ids,
+        attention_mask=None,
+        position_ids=pos_ids,
+        **model_kwargs,
+    )
+    return _extract_response_log_probs(outputs.logits, row_ids, packed, row_idx)
 
 
 def grpo_loss(

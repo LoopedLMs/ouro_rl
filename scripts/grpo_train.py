@@ -32,11 +32,19 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
 
 from ouro_rl.data import INTERRUPTION_PHRASE, format_prompt, load_math_train
 from ouro_rl.distributed import broadcast_object, get_rank, get_world_size, is_dist, shard_range, sync_gradients, sync_metrics
-from ouro_rl.grpo import cispo_loss, compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
+from ouro_rl.grpo import (
+    cispo_loss,
+    compute_advantages,
+    compute_log_probs_packed,
+    forward_packed_row_with_grad,
+    grpo_loss,
+)
 from ouro_rl.modeling import BOS_TOKEN_ID, CHAT_TEMPLATE, EOS_TOKEN_ID, PAD_TOKEN_ID, OuroForCausalLM
+from ouro_rl.packing import PackedBatch, pack_sequences
 from ouro_rl.reward import score_answer
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,7 @@ class GRPOConfig:
 
     # Dataset
     dataset_name: str = "qwedsacf/competition_math"
+    min_level: int | None = 5  # Filter MATH problems by minimum difficulty (1-5)
     system_prompt: str | None = None  # None = no system prompt (see ouro_rl/data.py for alternatives)
 
     # Training
@@ -92,8 +101,9 @@ class GRPOConfig:
     answer_budget: int = 512  # max tokens for answer after interruption
 
     # Memory
-    log_prob_micro_batch: int = 4  # micro-batch for log-prob forward passes
-    train_micro_batch: int = 2  # micro-batch for training forward/backward
+    gradient_checkpointing: bool = True  # trade compute for memory (saves ~77 GB activations)
+    log_prob_micro_batch: int = 16  # micro-batch for log-prob forward passes
+    train_micro_batch: int = 16  # micro-batch for training forward/backward
 
     # Logging & checkpointing
     output_dir: str = "outputs/grpo"
@@ -230,16 +240,12 @@ def run_vllm_generation(
         result = subprocess.run(
             [sys.executable, _WORKER_SCRIPT, request_path, response_path],
             env=env,
-            capture_output=True,
-            text=True,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
         )
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"vLLM worker subprocess failed (exit code {result.returncode}).\n"
-                f"--- stdout ---\n{result.stdout[-2000:] if result.stdout else '(empty)'}\n"
-                f"--- stderr ---\n{result.stderr[-2000:] if result.stderr else '(empty)'}"
-            )
+            raise RuntimeError(f"vLLM worker subprocess failed (exit code {result.returncode}). Check stderr for details.")
 
         response = torch.load(response_path, weights_only=False)
 
@@ -367,77 +373,78 @@ def train_step(
     ref_model: OuroForCausalLM | None,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    tokenized: dict[str, torch.Tensor],
+    packed: PackedBatch,
     advantages: torch.Tensor,
     config: GRPOConfig,
 ) -> dict[str, float]:
-    """Single GRPO gradient update with micro-batching.
+    """Single GRPO gradient update using packed forward passes.
+
+    Each packed row is processed as a single forward pass (batch_size=1).
+    FlashAttention's varlen support provides block-diagonal attention.
 
     When config.kl_coeff == 0, ref_model can be None and ref log-probs are skipped.
 
     Returns aggregated metrics dict.
     """
     device = next(policy_model.parameters()).device
-    input_ids = tokenized["input_ids"].to(device)
-    attention_mask = tokenized["attention_mask"].to(device)
-    response_start_indices = tokenized["response_start_indices"].to(device)
-    response_mask = tokenized["response_mask"].to(device)
     advantages = advantages.to(device)
 
-    batch_size = input_ids.shape[0]
-
-    # Compute reference log-probs only when KL is enabled.
+    # Compute reference log-probs only when KL is enabled (no-grad, packed).
     ref_log_probs = None
     if config.kl_coeff > 0:
         assert ref_model is not None, "ref_model required when kl_coeff > 0"
-        ref_log_probs = compute_log_probs_batch(
-            ref_model,
-            input_ids,
-            attention_mask,
-            response_start_indices,
-            micro_batch_size=config.log_prob_micro_batch,
-            use_early_exit_gate=False,
-        )
+        ref_log_probs, _ = compute_log_probs_packed(ref_model, packed, use_early_exit_gate=False)
 
-    # Compute old log-probs only when num_iterations > 1 (the frozen snapshot anchors the
-    # clipping ratio across multiple optimization passes over the same rollouts).
-    # With num_iterations == 1, old == policy so ratio is always 1.0 and clipping is a no-op.
+    # Compute old log-probs only when num_iterations > 1 (no-grad, packed).
     old_log_probs = None
+    response_mask: torch.Tensor | None = None
     if config.num_iterations > 1:
-        old_log_probs = compute_log_probs_batch(
-            policy_model,
-            input_ids,
-            attention_mask,
-            response_start_indices,
-            micro_batch_size=config.log_prob_micro_batch,
-            use_early_exit_gate=False,
-        )
+        old_log_probs, response_mask = compute_log_probs_packed(policy_model, packed, use_early_exit_gate=False)
 
-    # Micro-batched forward/backward for policy gradient.
+    # If we didn't compute old_log_probs, we still need response_mask.
+    # Compute it from packed metadata (faster than a full forward pass).
+    if response_mask is None:
+        max_resp_len = max(info.total_len - (info.resp_offset - info.offset) for info in packed.seq_infos)
+        response_mask = torch.zeros(packed.num_sequences, max_resp_len, device=device)
+        for info in packed.seq_infos:
+            resp_len = info.total_len - (info.resp_offset - info.offset)
+            response_mask[info.seq_idx, :resp_len] = 1.0
+
+    # Pre-compute total response tokens for correct loss scaling across packed rows.
+    total_resp_tokens = response_mask.sum().item()
+
+    # Packed forward/backward: process one packed row at a time.
     optimizer.zero_grad()
     total_metrics: dict[str, float] = {}
-    mb_size = config.train_micro_batch
-    num_micro_batches = (batch_size + mb_size - 1) // mb_size
+    num_rows = packed.num_rows
 
-    for mb_start in range(0, batch_size, mb_size):
-        mb_end = min(mb_start + mb_size, batch_size)
-        mb_slice = slice(mb_start, mb_end)
+    for row_idx in range(num_rows):
+        # Forward with gradients on this packed row.
+        per_seq = forward_packed_row_with_grad(policy_model, packed, row_idx, use_early_exit_gate=False)
 
-        policy_lp = compute_log_probs_with_grad(
-            policy_model,
-            input_ids[mb_slice],
-            attention_mask[mb_slice],
-            response_start_indices[mb_slice],
-            use_early_exit_gate=False,
-        )
+        # Pad this row's sequences to match the global response_mask width.
+        max_resp_len = response_mask.shape[1]
+        row_seq_indices = [s for s, _ in per_seq]
+        num_in_row = len(row_seq_indices)
+
+        policy_lp = torch.zeros(num_in_row, max_resp_len, device=device)
+        for i, (_seq_idx, lp) in enumerate(per_seq):
+            policy_lp[i, : lp.shape[0]] = lp
+
+        # Gather corresponding data for sequences in this row.
+        idx_tensor = torch.tensor(row_seq_indices, dtype=torch.long)
+        row_advantages = advantages[idx_tensor]
+        row_response_mask = response_mask[idx_tensor]
+        row_old_lp = old_log_probs[idx_tensor] if old_log_probs is not None else None
+        row_ref_lp = ref_log_probs[idx_tensor] if ref_log_probs is not None else None
 
         loss_kwargs = {
             "policy_log_probs": policy_lp,
-            "old_log_probs": old_log_probs[mb_slice] if old_log_probs is not None else None,
-            "advantages": advantages[mb_slice],
-            "response_mask": response_mask[mb_slice],
+            "old_log_probs": row_old_lp,
+            "advantages": row_advantages,
+            "response_mask": row_response_mask,
             "kl_coeff": config.kl_coeff,
-            "ref_log_probs": ref_log_probs[mb_slice] if ref_log_probs is not None else None,
+            "ref_log_probs": row_ref_lp,
             "token_level_loss": config.token_level_loss,
         }
         if config.loss_type == "cispo":
@@ -445,12 +452,20 @@ def train_step(
         else:
             loss, metrics = grpo_loss(**loss_kwargs, clip_eps=config.clip_eps)
 
-        # Scale loss by number of micro-batches for correct gradient averaging.
-        scaled_loss = loss / num_micro_batches
+        # Scale: loss_fn divides by row's response tokens, but we need global total.
+        # weight = (row_resp_tokens / total_resp_tokens) for token_level_loss,
+        #          (num_seqs_in_row / total_seqs) for sequence_level_loss.
+        if config.token_level_loss:
+            row_resp_tokens = row_response_mask.sum().item()
+            weight = row_resp_tokens / max(total_resp_tokens, 1.0)
+        else:
+            weight = num_in_row / packed.num_sequences
+
+        scaled_loss = loss * weight
         scaled_loss.backward()
 
         for k, v in metrics.items():
-            total_metrics[k] = total_metrics.get(k, 0.0) + v / num_micro_batches
+            total_metrics[k] = total_metrics.get(k, 0.0) + v * weight
 
     # Sync gradients across ranks before clipping.
     sync_gradients(policy_model)
@@ -492,7 +507,7 @@ def main(config: GRPOConfig) -> None:
 
     set_seed(config.seed)
 
-    output_dir = Path(config.output_dir)
+    output_dir = Path(config.output_dir) / (config.wandb_run_name or "default")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config (rank 0 only).
@@ -517,6 +532,8 @@ def main(config: GRPOConfig) -> None:
     if rank == 0:
         logger.info("Loading MATH dataset: %s", config.dataset_name)
     dataset = load_math_train(config.dataset_name)
+    if config.min_level is not None:
+        dataset = dataset.filter(lambda x: x["level"].startswith("Level") and x["level"][-1].isdigit() and int(x["level"][-1]) >= config.min_level)
     problems = dataset["problem"]
     solutions = dataset["solution"]
     if rank == 0:
@@ -537,15 +554,26 @@ def main(config: GRPOConfig) -> None:
 
     # Load policy + reference models for training.
     torch_dtype = getattr(torch, config.dtype)
+    if is_flash_attn_3_available():
+        attn_implementation = "flash_attention_3"
+    elif is_flash_attn_2_available():
+        attn_implementation = "flash_attention_2"
+    else:
+        attn_implementation = "eager"
+    
+    logger.info("[rank %d] Attention implementation: %s", rank, attn_implementation)
     if rank == 0:
         logger.info("Loading policy model: %s", config.model_name)
     policy_model = OuroForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch_dtype,
+        attn_implementation=attn_implementation,
         device_map={"": device},
     )
     if config.fp32_lm_head:
         policy_model.enable_fp32_lm_head()
+    if config.gradient_checkpointing:
+        policy_model.gradient_checkpointing_enable()
     policy_model.train()
 
     ref_model = None
@@ -555,6 +583,7 @@ def main(config: GRPOConfig) -> None:
         ref_model = OuroForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
             device_map={"": device},
         )
         if config.fp32_lm_head:
@@ -804,10 +833,16 @@ def main(config: GRPOConfig) -> None:
                 )
             continue
 
-        # Pad local batch into tensors (each rank already has its own shard from generation).
-        max_length = config.max_model_len
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        tokenized = pad_token_id_pairs(flat_prompt_ids, flat_response_ids, max_length, pad_token_id=pad_id)
+        # Pack local batch into packed rows for efficient forward passes.
+        packed = pack_sequences(flat_prompt_ids, flat_response_ids, config.max_model_len)
+        if rank == 0:
+            logger.info(
+                "[Step %d/%d] Packed %d sequences into %d rows",
+                step,
+                config.num_steps,
+                packed.num_sequences,
+                packed.num_rows,
+            )
 
         # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
@@ -817,7 +852,7 @@ def main(config: GRPOConfig) -> None:
                 ref_model,
                 optimizer,
                 scheduler,
-                tokenized,
+                packed,
                 flat_advantages,
                 config,
             )
@@ -915,6 +950,7 @@ def parse_args() -> GRPOConfig:
     p = argparse.ArgumentParser(description="GRPO training for Ouro")
     p.add_argument("--model", dest="model_name")
     p.add_argument("--dataset", dest="dataset_name")
+    p.add_argument("--min-level", type=int, choices=[1, 2, 3, 4, 5])
     p.add_argument("--num-steps", type=int)
     p.add_argument("--prompts-per-step", type=int)
     p.add_argument("--rollouts-per-prompt", type=int)
@@ -933,6 +969,9 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--thinking-budget-min", type=int)
     p.add_argument("--thinking-budget-max", type=int)
     p.add_argument("--answer-budget", type=int)
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--train-micro-batch", type=int)
+    p.add_argument("--log-prob-micro-batch", type=int)
     p.add_argument("--output-dir")
     p.add_argument("--save-every", type=int)
     p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)
