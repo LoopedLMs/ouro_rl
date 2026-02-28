@@ -510,9 +510,9 @@ def main(config: GRPOConfig) -> None:
     output_dir = Path(config.output_dir) / (config.wandb_run_name or "default")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config (rank 0 only).
+    # Save GRPO run config (rank 0 only).
     if rank == 0:
-        with open(output_dir / "config.json", "w") as f:
+        with open(output_dir / "grpo_config.json", "w") as f:
             json.dump(config.__dict__, f, indent=2, default=str)
 
     # Wandb setup (rank 0 only).

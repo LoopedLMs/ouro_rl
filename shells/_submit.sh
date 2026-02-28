@@ -145,8 +145,15 @@ if [ -n "$QOS" ]; then
     SBATCH_CMD="$SBATCH_CMD --qos=$QOS"
 fi
 
-# Add GPU resources for GPU jobs
-if [ -n "$GRES" ]; then
+# Add GPU resources for GPU jobs (skip if --gres is in extra args)
+GRES_SET=false
+for arg in "${SBATCH_EXTRA_ARGS[@]}"; do
+    if [[ "$arg" =~ ^--gres= ]]; then
+        GRES_SET=true
+        break
+    fi
+done
+if [ -n "$GRES" ] && [ "$GRES_SET" = false ]; then
     SBATCH_CMD="$SBATCH_CMD $GRES"
 fi
 

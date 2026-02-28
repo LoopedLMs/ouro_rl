@@ -3,13 +3,6 @@
 # Use with: --apply_chat_template --include_path eval/tasks
 include: _math_base.yaml
 task: aime24_thinking
-generation_kwargs:
-  until:
-    - "<|im_end|>"
-  do_sample: true
-  temperature: 1.0
-  top_p: 0.7
-  max_gen_toks: 8192
 dataset_path: Maxwell-Jia/AIME_2024
 dataset_name: null
 test_split: train

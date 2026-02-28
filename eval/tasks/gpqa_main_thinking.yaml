@@ -16,7 +16,7 @@ generation_kwargs:
   do_sample: true
   temperature: 1.0
   top_p: 0.7
-  max_gen_toks: 4096
+  max_gen_toks: 30768
 num_fewshot: 0
 process_results: !function utils_qa.process_results
 metric_list:

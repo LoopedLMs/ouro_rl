@@ -5,7 +5,8 @@
 # Smoke test:    LIMIT=20 ./eval/shells/eval-code.sh
 
 set -euo pipefail
-source "$(dirname "$0")/eval-common.sh"
+cd ~/ouro_rl
+source eval/shells/eval-common.sh
 
 TASKS="${TASKS:-mbpp}"
 

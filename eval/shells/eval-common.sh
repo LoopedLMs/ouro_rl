@@ -3,13 +3,18 @@
 #
 # Override any variable via environment:
 #   MODEL=path/to/checkpoint ./eval/shells/eval-math.sh
-#   TP=2 LIMIT=50 ./eval/shells/eval-math.sh
+#   LIMIT=50 ./eval/shells/eval-math.sh
 
-cd "$(dirname "$0")/../.."
+cd ~/ouro_rl
+uv sync
+source .venv/bin/activate
+
+source shells/_machine_config.sh
+validate_config || exit 1
 
 MODEL="${MODEL:-ByteDance/Ouro-1.4B-Thinking}"
-TP="${TP:-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-9216}"
+TP=${NUM_GPUS:-1}
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval/outputs}"
 LIMIT="${LIMIT:-}"
 LOG_SAMPLES="${LOG_SAMPLES:-true}"

@@ -1,0 +1,12 @@
+# AIME 2025 for thinking models (zero-shot, \boxed{} answer format).
+# Scoring: math-verify symbolic comparison (inherited from _math_base.yaml).
+# Use with: --apply_chat_template --include_path eval/tasks
+include: _math_base.yaml
+task: aime25_thinking
+dataset_path: math-ai/aime25
+dataset_name: null
+test_split: test
+doc_to_text: "{{problem}}\n\nPut your final answer in \\boxed{}."
+doc_to_target: "{{answer}}"
+metadata:
+  version: 1.0
