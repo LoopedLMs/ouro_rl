@@ -13,6 +13,7 @@ source shells/_machine_config.sh
 validate_config || exit 1
 
 MODEL="${MODEL:-ByteDance/Ouro-1.4B-Thinking}"
+ENABLE_THINKING="${ENABLE_THINKING:-true}"
 TP=${NUM_GPUS:-1}
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval/outputs}"
@@ -27,7 +28,7 @@ if [[ ! -d "$TOKENIZER_DIR" ]]; then
 fi
 
 # --- vLLM model args ---
-MODEL_ARGS="pretrained=$MODEL,tokenizer=$TOKENIZER_DIR,trust_remote_code=True,dtype=bfloat16,max_model_len=$MAX_MODEL_LEN,tensor_parallel_size=$TP,enable_thinking=True,think_end_token=</think>"
+MODEL_ARGS="pretrained=$MODEL,tokenizer=$TOKENIZER_DIR,trust_remote_code=True,dtype=bfloat16,max_model_len=$MAX_MODEL_LEN,tensor_parallel_size=$TP,enable_thinking=$ENABLE_THINKING,think_end_token=</think>"
 
 LIMIT_ARG=""
 if [[ -n "$LIMIT" ]]; then
