@@ -1,8 +1,72 @@
-"""Unit tests for ouro_rl/data.py — prompt formatting and answer extraction."""
+"""Unit tests for ouro_rl/data.py — dataset loading, prompt formatting, answer extraction."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from ouro_rl.data import CHAT_TEMPLATE, extract_boxed_answer, format_prompt
+from datasets import Dataset
+
+from ouro_rl.data import CHAT_TEMPLATE, extract_boxed_answer, format_prompt, load_math_train
+
+# ---------------------------------------------------------------------------
+# load_math_train (DeepMath-103K)
+# ---------------------------------------------------------------------------
+
+
+def _make_deepmath_dataset() -> Dataset:
+    """Minimal fake DeepMath-103K rows with the upstream column names."""
+    return Dataset.from_dict(
+        {
+            "question": ["Prove that sqrt(2) is irrational.", "Find all primes p such that p+2 is also prime."],
+            "final_answer": ["Assume for contradiction...", "p=3"],
+            "difficulty": [7.0, 5.0],  # float64 in the real dataset
+            "topic": ["Number Theory", "Number Theory"],
+            "r1_solution_1": ["solution a", "solution b"],
+        }
+    )
+
+
+class TestLoadMathTrain:
+    def test_default_dataset_name(self):
+        """load_math_train calls load_dataset with zwhe99/DeepMath-103K by default."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds) as mock_load:
+            load_math_train()
+        mock_load.assert_called_once_with("zwhe99/DeepMath-103K", split="train")
+
+    def test_columns_remapped(self):
+        """question→problem and answer→solution after loading."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        assert "problem" in ds.column_names
+        assert "solution" in ds.column_names
+        assert "question" not in ds.column_names
+        assert "answer" not in ds.column_names
+
+    def test_difficulty_column_preserved(self):
+        """The numeric difficulty column (1-9) is retained after remapping."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        assert "difficulty" in ds.column_names
+        assert all(isinstance(d, float) for d in ds["difficulty"])
+
+    def test_problem_solution_values_correct(self):
+        """Remapped values match the original question/answer fields."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        assert ds["problem"][0] == "Prove that sqrt(2) is irrational."
+        assert ds["solution"][1] == "p=3"
+
+    def test_min_level_filter(self):
+        """Filtering by difficulty >= min_level (as grpo_train.py does) works correctly."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        filtered = ds.filter(lambda x: x["difficulty"] >= 6)
+        assert len(filtered) == 1
+        assert filtered["problem"][0] == "Prove that sqrt(2) is irrational."
+
 
 # ---------------------------------------------------------------------------
 # extract_boxed_answer

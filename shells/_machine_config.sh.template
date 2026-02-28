@@ -20,8 +20,8 @@ export SLURM_PARTITION_GPU="your-gpu-partition"
 export SLURM_QOS_GPU="your-gpu-qos"
 export SLURM_ACCOUNT=""                        # Optional: SLURM account (e.g., "eagle"), leave empty if not required
 export NUM_GPUS="${NUM_GPUS:-2}"               # Number of GPUs per job (overridable via env)
-export SLURM_GPU_TYPE=""                       # Optional: GPU type constraint (e.g., "h100", "a100"), leave empty for any GPU
-export SLURM_GPU_MEM=""                        # Optional: GPU memory per GPU (e.g., "20G"), leave empty if not supported
+export SLURM_GPU_TYPE="${SLURM_GPU_TYPE:-}"    # Optional: GPU type constraint (e.g., "h100", "a100"), leave empty for any GPU
+export SLURM_GPU_MEM="${SLURM_GPU_MEM:-}"      # Optional: GPU memory per GPU (e.g., "20G"), leave empty if not supported
 export SLURM_MEM_GPU="64G"
 export SLURM_MAIL_USER="your.email@example.com"
 

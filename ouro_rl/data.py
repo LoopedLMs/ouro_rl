@@ -25,13 +25,13 @@ MATH_SYSTEM_PROMPT: str | None = None
 INTERRUPTION_PHRASE = "Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n"
 
 
-def load_math_train(dataset_name: str = "qwedsacf/competition_math") -> Dataset:
-    """Load MATH training split.
+def load_math_train(dataset_name: str = "zwhe99/DeepMath-103K") -> Dataset:
+    """Load math training split from DeepMath-103K.
 
-    Columns: problem, level, type, solution.
-    The solution contains the final answer in \\boxed{...}.
+    Columns after remapping: problem, solution (raw answer), difficulty (int 1-9).
     """
-    return load_dataset(dataset_name, split="train")
+    ds = load_dataset(dataset_name, split="train")
+    return ds.rename_columns({"question": "problem", "final_answer": "solution"})
 
 
 def format_prompt(

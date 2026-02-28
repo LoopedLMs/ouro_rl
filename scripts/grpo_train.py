@@ -66,8 +66,8 @@ class GRPOConfig:
     max_model_len: int = 6144  # vLLM context window (prompt avg 89, response p75 = 2793)
 
     # Dataset
-    dataset_name: str = "qwedsacf/competition_math"
-    min_level: int | None = 5  # Filter MATH problems by minimum difficulty (1-5)
+    dataset_name: str = "zwhe99/DeepMath-103K"
+    min_level: int | None = 6  # Filter problems by minimum difficulty (DeepMath: 1-9)
     system_prompt: str | None = None  # None = no system prompt (see ouro_rl/data.py for alternatives)
 
     # Training
@@ -533,9 +533,7 @@ def main(config: GRPOConfig) -> None:
         logger.info("Loading MATH dataset: %s", config.dataset_name)
     dataset = load_math_train(config.dataset_name)
     if config.min_level is not None:
-        dataset = dataset.filter(
-            lambda x: x["level"].startswith("Level") and x["level"][-1].isdigit() and int(x["level"][-1]) >= config.min_level
-        )
+        dataset = dataset.filter(lambda x: x["difficulty"] >= config.min_level)
     problems = dataset["problem"]
     solutions = dataset["solution"]
     if rank == 0:
@@ -956,7 +954,7 @@ def parse_args() -> GRPOConfig:
     p = argparse.ArgumentParser(description="GRPO training for Ouro")
     p.add_argument("--model", dest="model_name")
     p.add_argument("--dataset", dest="dataset_name")
-    p.add_argument("--min-level", type=int, choices=[1, 2, 3, 4, 5])
+    p.add_argument("--min-level", type=int, choices=list(range(1, 10)))
     p.add_argument("--num-steps", type=int)
     p.add_argument("--prompts-per-step", type=int)
     p.add_argument("--rollouts-per-prompt", type=int)
