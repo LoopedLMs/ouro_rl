@@ -111,6 +111,7 @@ if [[ "$SCRIPT_PATH" =~ _cpu\.sh$ ]]; then
     QOS="$SLURM_QOS_CPU"
     MEM="$SLURM_MEM_CPU"
     GRES=""
+    CPUS_PER_TASK="${SLURM_CPUS_CPU:-1}"
 else
     JOB_TYPE="gpu"
     PARTITION="$SLURM_PARTITION_GPU"
@@ -125,6 +126,7 @@ else
     if [ -n "$SLURM_GPU_MEM" ]; then
         GRES="$GRES,gpumem:$SLURM_GPU_MEM"
     fi
+    CPUS_PER_TASK="${SLURM_CPUS_GPU:-}"
 fi
 
 # Create log directory based on script name
@@ -154,6 +156,11 @@ fi
 # Add GPU resources for GPU jobs
 if [ -n "$GRES" ]; then
     SBATCH_CMD="$SBATCH_CMD $GRES"
+fi
+
+# Add CPU count for CPU jobs
+if [ -n "$CPUS_PER_TASK" ]; then
+    SBATCH_CMD="$SBATCH_CMD --cpus-per-task=$CPUS_PER_TASK"
 fi
 
 # Add mail notifications for GPU jobs (usually longer running)
@@ -207,6 +214,9 @@ if [ -n "$GRES" ]; then
     if [ -n "$SLURM_GPU_MEM" ]; then
         echo "  GPU Mem:   $SLURM_GPU_MEM (each)"
     fi
+fi
+if [ -n "$CPUS_PER_TASK" ]; then
+    echo "  CPUs:      $CPUS_PER_TASK"
 fi
 if [ ${#SCRIPT_ARGS[@]} -gt 0 ]; then
     echo "  Script args: ${SCRIPT_ARGS[*]}"

@@ -23,12 +23,14 @@ export NUM_GPUS="${NUM_GPUS:-2}"               # Number of GPUs per job (overrid
 export SLURM_GPU_TYPE="${SLURM_GPU_TYPE:-}"    # Optional: GPU type constraint (e.g., "h100", "a100"), leave empty for any GPU
 export SLURM_GPU_MEM="${SLURM_GPU_MEM:-}"      # Optional: GPU memory per GPU (e.g., "20G"), leave empty if not supported
 export SLURM_MEM_GPU="64G"
+export SLURM_CPUS_GPU="${SLURM_CPUS_GPU:-16}"     # CPUs to request for GPU jobs
 export SLURM_MAIL_USER="your.email@example.com"
 
-# CPU Jobs (for data downloads, tokenizer training)
-export SLURM_PARTITION_CPU="lrz-cpu"             # CPU partition name
-export SLURM_QOS_CPU="cpu"                       # CPU QoS
-export SLURM_MEM_CPU="32G"                       # Memory for CPU jobs
+# CPU jobs (data preprocessing, downloads)
+export SLURM_PARTITION_CPU="your-cpu-partition"
+export SLURM_QOS_CPU="your-cpu-qos"
+export SLURM_MEM_CPU="64G"
+export SLURM_CPUS_CPU="${SLURM_CPUS_CPU:-32}"    # CPUs to request for CPU jobs
 
 # ============================================================================
 # Validation Function
