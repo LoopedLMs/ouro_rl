@@ -4,7 +4,6 @@ Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
 Supports data-parallel training and generation across multiple GPUs.
 
 Usage:
-    torchrun --standalone --nproc_per_node=1 scripts/grpo_train.py --smoke_test=true --wandb_enabled=false  # single GPU
     torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                                        # multi-GPU
     torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py --config=config.yaml                   # from config file
 
@@ -63,7 +62,7 @@ class GRPOConfig:
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
     fp32_lm_head: bool = False  # Upcast lm_head matmul to fp32 (ScaleRL fix). Disable on low VRAM.
-    max_model_len: int = 6144  # vLLM context window (prompt avg 89, response p75 = 2793)
+    max_model_len: int | None = None  # vLLM context window (derived from token budgets if None)
 
     # Dataset
     dataset_name: str = "zwhe99/DeepMath-103K"
@@ -89,16 +88,17 @@ class GRPOConfig:
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
-    max_new_tokens: int = 4608
+    max_new_tokens: int | None = None  # max response tokens (derived from budgets if None)
     temperature: float = 1.0
     top_p: float = 0.7
     enable_thinking: bool = True
 
     # Interruptions (ScaleRL: force truncated completions to produce an answer)
     enable_interruptions: bool = True
-    thinking_budget_min: int = 3072  # min thinking tokens before interruption
-    thinking_budget_max: int = 4096  # max thinking tokens (randomized per step)
+    thinking_budget: int = 4096  # max thinking tokens (randomized per step within [min_frac, 1.0])
+    thinking_budget_min_frac: float = 0.75  # fraction of thinking_budget for minimum
     answer_budget: int = 512  # max tokens for answer after interruption
+    prompt_budget: int = 2048  # headroom reserved for prompts in context window
 
     # Memory
     gradient_checkpointing: bool = True  # trade compute for memory (saves ~77 GB activations)
@@ -112,28 +112,18 @@ class GRPOConfig:
     wandb_project: str = "ouro-rl"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
-    quiet_vllm: bool = False  # Suppress vLLM subprocess output
+    quiet_vllm: bool = True  # Suppress vLLM subprocess output
 
     # Reproducibility
     seed: int = 42
 
-    # Smoke test overrides
-    smoke_test: bool = False
-
     def __post_init__(self) -> None:
-        if self.smoke_test:
-            self.num_steps = 3
-            self.prompts_per_step = 4
-            self.rollouts_per_prompt = 4
-            self.save_every = 1
-            self.max_new_tokens = 256
-            self.max_model_len = 512
-            self.pack_len = 1024
-            if self.enable_interruptions:
-                self.thinking_budget_min = 128
-                self.thinking_budget_max = 192
-                self.answer_budget = 64
-
+        # Derive token limits from budgets.
+        self._thinking_budget_min: int = int(self.thinking_budget * self.thinking_budget_min_frac)
+        if self.max_new_tokens is None:
+            self.max_new_tokens = self.thinking_budget + self.answer_budget
+        if self.max_model_len is None:
+            self.max_model_len = self.max_new_tokens + self.prompt_budget
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +623,9 @@ def main(cfg: GRPOConfig) -> None:
 
         # --- 2. Generate rollouts with vLLM (data-parallel) ---
         if rank == 0:
-            logger.info("[Step %d/%d] Generating %d rollouts...", step, cfg.num_steps, cfg.prompts_per_step * cfg.rollouts_per_prompt)
+            logger.info(
+                "[Step %d/%d] Generating %d rollouts...", step, cfg.num_steps, cfg.prompts_per_step * cfg.rollouts_per_prompt
+            )
 
         # Move training models + optimizer state to CPU to free GPU memory for vLLM.
         policy_model.cpu()
@@ -658,7 +650,7 @@ def main(cfg: GRPOConfig) -> None:
         if cfg.enable_interruptions:
             # Two-phase generation: thinking → interruption → answer.
             # Sync thinking budget so all ranks use the same value.
-            thinking_budget = random.randint(cfg.thinking_budget_min, cfg.thinking_budget_max) if rank == 0 else 0
+            thinking_budget = random.randint(cfg._thinking_budget_min, cfg.thinking_budget) if rank == 0 else 0
             thinking_budget = broadcast_object(thinking_budget)
 
             think_close_id = tokenizer.convert_tokens_to_ids("</think>")
@@ -735,7 +727,9 @@ def main(cfg: GRPOConfig) -> None:
             "completions/clipped_ratio": clipped_ratio,
         }
         if cfg.enable_interruptions:
-            completion_log_data["completions/interrupted_ratio"] = n_interrupted / cfg.prompts_per_step * cfg.rollouts_per_prompt
+            completion_log_data["completions/interrupted_ratio"] = (
+                n_interrupted / cfg.prompts_per_step * cfg.rollouts_per_prompt
+            )
             completion_log_data["completions/thinking_budget"] = thinking_budget
         completion_log_data = sync_metrics(completion_log_data, device)
 
@@ -884,19 +878,25 @@ def main(cfg: GRPOConfig) -> None:
         if step % cfg.log_every == 0 and rank == 0:
             kl_str = f" kl={metrics['kl']:.4f}" if "kl" in metrics else ""
             logger.info(
-                "[Step %d/%d] reward=%.3f correct=%.1f%% len=%.0f grad=%.4f surr=%.4f%s"
-                " ratio=%.3f clip=%.3f trunc=%.1f%% gen=%.1fs train=%.1fs",
+                "[Step %d/%d] reward=%.3f correct=%.1f%% zero_std=%.2f"
+                " len=%.0f/%.0f lr=%.1e grad=%.4f surr=%.4f%s"
+                " ratio=%.3f clip=%.3f trunc=%.1f%%"
+                " time=%.1fs (gen=%.1fs train=%.1fs)",
                 step,
                 cfg.num_steps,
                 mean_reward,
                 fraction_correct * 100,
+                frac_reward_zero_std,
                 completion_log_data["completions/mean_length"],
+                completion_log_data["completions/max_length"],
+                metrics.get("lr", 0),
                 metrics.get("grad_norm", 0),
                 metrics.get("surrogate_loss", 0),
                 kl_str,
                 metrics.get("mean_ratio", 1),
                 metrics.get("clip_ratio", metrics.get("truncation_ratio", 0)),
                 completion_log_data["completions/clipped_ratio"] * 100,
+                step_time,
                 gen_time,
                 train_time,
             )
