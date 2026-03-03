@@ -4,8 +4,9 @@ Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
 Supports data-parallel training and generation across multiple GPUs.
 
 Usage:
-    torchrun --standalone --nproc_per_node=1 scripts/grpo_train.py --smoke-test --no-wandb  # single GPU
-    torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                          # multi-GPU
+    torchrun --standalone --nproc_per_node=1 scripts/grpo_train.py --smoke_test=true --wandb_enabled=false  # single GPU
+    torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                                        # multi-GPU
+    torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py --config=config.yaml                   # from config file
 
 Architecture:
     - vLLM: generates rollouts in a subprocess (exits when done → OS frees all GPU memory)
@@ -16,7 +17,6 @@ Architecture:
       (no DDP wrapper, compatible with CPU↔GPU swap)
 """
 
-import argparse
 import json
 import logging
 import os
@@ -112,6 +112,7 @@ class GRPOConfig:
     wandb_project: str = "ouro-rl"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
+    quiet_vllm: bool = False  # Suppress vLLM subprocess output
 
     # Reproducibility
     seed: int = 42
@@ -133,10 +134,6 @@ class GRPOConfig:
                 self.thinking_budget_max = 192
                 self.answer_budget = 64
 
-    # Derived
-    @property
-    def total_rollouts_per_step(self) -> int:
-        return self.prompts_per_step * self.rollouts_per_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +176,7 @@ def run_vllm_generation(
     stop_token_ids: list[int],
     interruptions: dict | None = None,
     gpu_id: int = 0,
+    quiet: bool = False,
 ) -> tuple[list[list[list[int]]], int]:
     """Run vLLM generation in a subprocess and return results.
 
@@ -235,11 +233,12 @@ def run_vllm_generation(
         env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env["VLLM_HOST_IP"] = "127.0.0.1"
 
+        vllm_output = subprocess.DEVNULL if quiet else sys.stderr
         result = subprocess.run(
             [sys.executable, _WORKER_SCRIPT, request_path, response_path],
             env=env,
-            stdout=sys.stderr,
-            stderr=sys.stderr,
+            stdout=vllm_output,
+            stderr=vllm_output,
         )
 
         if result.returncode != 0:
@@ -490,8 +489,8 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def main(config: GRPOConfig) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+def main(cfg: GRPOConfig) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s", stream=sys.stdout)
 
     # Distributed setup — always use torchrun (even single-GPU: torchrun --standalone --nproc_per_node=1).
     dist.init_process_group(backend="nccl")
@@ -501,28 +500,28 @@ def main(config: GRPOConfig) -> None:
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    assert config.prompts_per_step % world_size == 0, (
-        f"prompts_per_step ({config.prompts_per_step}) must be divisible by world_size ({world_size})"
+    assert cfg.prompts_per_step % world_size == 0, (
+        f"prompts_per_step ({cfg.prompts_per_step}) must be divisible by world_size ({world_size})"
     )
 
-    set_seed(config.seed)
+    set_seed(cfg.seed)
 
-    output_dir = Path(config.output_dir) / (config.wandb_run_name or "default")
+    output_dir = Path(cfg.output_dir) / (cfg.wandb_run_name or "default")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save GRPO run config (rank 0 only).
     if rank == 0:
-        with open(output_dir / "grpo_config.json", "w") as f:
-            json.dump(config.__dict__, f, indent=2, default=str)
+        with open(output_dir / "grpo_cfg.json", "w") as f:
+            json.dump(cfg.__dict__, f, indent=2, default=str)
 
     # Wandb setup (rank 0 only).
-    if config.wandb_enabled and rank == 0:
+    if cfg.wandb_enabled and rank == 0:
         import wandb
 
-        wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=config.__dict__)
+        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=cfg.__dict__)
 
     # Load tokenizer with fixed token IDs and chat template.
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
     tokenizer.bos_token_id = BOS_TOKEN_ID
     tokenizer.eos_token_id = EOS_TOKEN_ID
     tokenizer.pad_token_id = PAD_TOKEN_ID
@@ -530,17 +529,17 @@ def main(config: GRPOConfig) -> None:
 
     # Load dataset.
     if rank == 0:
-        logger.info("Loading MATH dataset: %s", config.dataset_name)
-    dataset = load_math_train(config.dataset_name)
-    if config.min_level is not None:
-        dataset = dataset.filter(lambda x: x["difficulty"] >= config.min_level)
+        logger.info("Loading MATH dataset: %s", cfg.dataset_name)
+    dataset = load_math_train(cfg.dataset_name)
+    if cfg.min_level is not None:
+        dataset = dataset.filter(lambda x: x["difficulty"] >= cfg.min_level)
     problems = dataset["problem"]
     solutions = dataset["solution"]
     if rank == 0:
         logger.info("Loaded %d problems", len(problems))
 
     # The current model path — starts as the base model, updated after checkpoints.
-    current_model_path = config.model_name
+    current_model_path = cfg.model_name
 
     # Resolve custom code files (configuration_ouro.py, modeling_ouro.py) from HF cache
     # so we can copy them into checkpoints — vLLM needs them for trust_remote_code.
@@ -548,12 +547,12 @@ def main(config: GRPOConfig) -> None:
 
     _custom_code_files: list[Path] = []
     for fname in ("configuration_ouro.py", "modeling_ouro.py"):
-        cached = try_to_load_from_cache(config.model_name, fname)
+        cached = try_to_load_from_cache(cfg.model_name, fname)
         if isinstance(cached, str):
             _custom_code_files.append(Path(cached))
 
     # Load policy + reference models for training.
-    torch_dtype = getattr(torch, config.dtype)
+    torch_dtype = getattr(torch, cfg.dtype)
     if is_flash_attn_3_available():
         attn_implementation = "flash_attention_3"
     elif is_flash_attn_2_available():
@@ -563,30 +562,30 @@ def main(config: GRPOConfig) -> None:
 
     logger.info("[rank %d] Attention implementation: %s", rank, attn_implementation)
     if rank == 0:
-        logger.info("Loading policy model: %s", config.model_name)
+        logger.info("Loading policy model: %s", cfg.model_name)
     policy_model = OuroForCausalLM.from_pretrained(
-        config.model_name,
+        cfg.model_name,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         device_map={"": device},
     )
-    if config.fp32_lm_head:
+    if cfg.fp32_lm_head:
         policy_model.enable_fp32_lm_head()
-    if config.gradient_checkpointing:
+    if cfg.gradient_checkpointing:
         policy_model.gradient_checkpointing_enable()
     policy_model.train()
 
     ref_model = None
-    if config.kl_coeff > 0:
+    if cfg.kl_coeff > 0:
         if rank == 0:
-            logger.info("Loading reference model: %s", config.model_name)
+            logger.info("Loading reference model: %s", cfg.model_name)
         ref_model = OuroForCausalLM.from_pretrained(
-            config.model_name,
+            cfg.model_name,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             device_map={"": device},
         )
-        if config.fp32_lm_head:
+        if cfg.fp32_lm_head:
             ref_model.enable_fp32_lm_head()
         ref_model.eval()
         for p in ref_model.parameters():
@@ -598,33 +597,33 @@ def main(config: GRPOConfig) -> None:
     # Optimizer + scheduler.
     optimizer = torch.optim.AdamW(
         policy_model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1e-2,
         end_factor=1.0,
-        total_iters=config.warmup_steps,
+        total_iters=cfg.warmup_steps,
     )
 
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
     if rank == 0:
-        logger.info("Starting GRPO training: %d steps, %d GPU(s)", config.num_steps, world_size)
+        logger.info("Starting GRPO training: %d steps, %d GPU(s)", cfg.num_steps, world_size)
 
-    for step in range(1, config.num_steps + 1):
+    for step in range(1, cfg.num_steps + 1):
         step_start = time.time()
 
         # --- 1. Sample prompts (rank 0 → broadcast) ---
-        indices = random.sample(range(len(problems)), config.prompts_per_step) if rank == 0 else None
+        indices = random.sample(range(len(problems)), cfg.prompts_per_step) if rank == 0 else None
         indices = broadcast_object(indices)
         batch_problems = [problems[i] for i in indices]
         batch_solutions = [solutions[i] for i in indices]
 
         prompts = [
-            format_prompt(p, tokenizer, system_prompt=config.system_prompt, enable_thinking=config.enable_thinking)
+            format_prompt(p, tokenizer, system_prompt=cfg.system_prompt, enable_thinking=cfg.enable_thinking)
             for p in batch_problems
         ]
         # Tokenize prompts once with correctly-configured HF tokenizer.
@@ -634,7 +633,7 @@ def main(config: GRPOConfig) -> None:
 
         # --- 2. Generate rollouts with vLLM (data-parallel) ---
         if rank == 0:
-            logger.info("[Step %d/%d] Generating %d rollouts...", step, config.num_steps, config.total_rollouts_per_step)
+            logger.info("[Step %d/%d] Generating %d rollouts...", step, cfg.num_steps, cfg.prompts_per_step * cfg.rollouts_per_prompt)
 
         # Move training models + optimizer state to CPU to free GPU memory for vLLM.
         policy_model.cpu()
@@ -656,10 +655,10 @@ def main(config: GRPOConfig) -> None:
 
         gpu_id = _get_gpu_id_for_subprocess(local_rank)
 
-        if config.enable_interruptions:
+        if cfg.enable_interruptions:
             # Two-phase generation: thinking → interruption → answer.
             # Sync thinking budget so all ranks use the same value.
-            thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max) if rank == 0 else 0
+            thinking_budget = random.randint(cfg.thinking_budget_min, cfg.thinking_budget_max) if rank == 0 else 0
             thinking_budget = broadcast_object(thinking_budget)
 
             think_close_id = tokenizer.convert_tokens_to_ids("</think>")
@@ -667,24 +666,25 @@ def main(config: GRPOConfig) -> None:
 
             my_rollout_ids, my_n_interrupted = run_vllm_generation(
                 model_path=current_model_path,
-                dtype=config.dtype,
-                max_model_len=config.max_model_len,
-                seed=config.seed,
+                dtype=cfg.dtype,
+                max_model_len=cfg.max_model_len,
+                seed=cfg.seed,
                 prompt_token_ids=my_prompt_token_ids,
-                n=config.rollouts_per_prompt,
-                temperature=config.temperature,
-                top_p=config.top_p,
+                n=cfg.rollouts_per_prompt,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
                 max_tokens=thinking_budget,
                 stop_token_ids=[EOS_TOKEN_ID],
                 interruptions={
                     "think_close_id": think_close_id,
                     "interruption_token_ids": interruption_token_ids,
-                    "phase2_temperature": config.temperature,
-                    "phase2_top_p": config.top_p,
-                    "phase2_max_tokens": config.answer_budget,
+                    "phase2_temperature": cfg.temperature,
+                    "phase2_top_p": cfg.top_p,
+                    "phase2_max_tokens": cfg.answer_budget,
                     "phase2_stop_token_ids": [EOS_TOKEN_ID],
                 },
                 gpu_id=gpu_id,
+                quiet=cfg.quiet_vllm,
             )
 
             # Sum interrupted counts across ranks for logging.
@@ -697,23 +697,24 @@ def main(config: GRPOConfig) -> None:
                 logger.info(
                     "[Step %d/%d] Generation complete: %d/%d interrupted",
                     step,
-                    config.num_steps,
+                    cfg.num_steps,
                     n_interrupted,
-                    config.total_rollouts_per_step,
+                    cfg.prompts_per_step * cfg.rollouts_per_prompt,
                 )
         else:
             my_rollout_ids, _ = run_vllm_generation(
                 model_path=current_model_path,
-                dtype=config.dtype,
-                max_model_len=config.max_model_len,
-                seed=config.seed,
+                dtype=cfg.dtype,
+                max_model_len=cfg.max_model_len,
+                seed=cfg.seed,
                 prompt_token_ids=my_prompt_token_ids,
-                n=config.rollouts_per_prompt,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                max_tokens=config.max_new_tokens,
+                n=cfg.rollouts_per_prompt,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                max_tokens=cfg.max_new_tokens,
                 stop_token_ids=[EOS_TOKEN_ID],
                 gpu_id=gpu_id,
+                quiet=cfg.quiet_vllm,
             )
 
         gen_time = time.time() - gen_start
@@ -733,8 +734,8 @@ def main(config: GRPOConfig) -> None:
             "completions/mean_length": mean_completion_len,
             "completions/clipped_ratio": clipped_ratio,
         }
-        if config.enable_interruptions:
-            completion_log_data["completions/interrupted_ratio"] = n_interrupted / config.total_rollouts_per_step
+        if cfg.enable_interruptions:
+            completion_log_data["completions/interrupted_ratio"] = n_interrupted / cfg.prompts_per_step * cfg.rollouts_per_prompt
             completion_log_data["completions/thinking_budget"] = thinking_budget
         completion_log_data = sync_metrics(completion_log_data, device)
 
@@ -762,7 +763,7 @@ def main(config: GRPOConfig) -> None:
         rewards_list: list[list[float]] = []
         for prompt_idx in range(my_num_prompts):
             group_rewards = []
-            for rollout_idx in range(config.rollouts_per_prompt):
+            for rollout_idx in range(cfg.rollouts_per_prompt):
                 r = score_answer(rollout_texts[prompt_idx][rollout_idx], batch_solutions[my_start + prompt_idx])
                 group_rewards.append(r)
             rewards_list.append(group_rewards)
@@ -783,18 +784,18 @@ def main(config: GRPOConfig) -> None:
 
         # --- 4. Compute advantages (group mean is local, batch std is global) ---
         batch_std = None
-        if config.scale_rewards == "batch" and is_dist():
+        if cfg.scale_rewards == "batch" and is_dist():
             stats = torch.stack([rewards.sum(), (rewards**2).sum(), torch.tensor(float(rewards.numel()))])
             stats = stats.to(device)
             dist.all_reduce(stats)
             global_mean = stats[0] / stats[2]
             batch_std = ((stats[1] / stats[2]) - global_mean**2).clamp(min=0).sqrt().cpu()
-        advantages = compute_advantages(rewards, scale_rewards=config.scale_rewards, batch_std=batch_std)
+        advantages = compute_advantages(rewards, scale_rewards=cfg.scale_rewards, batch_std=batch_std)
 
         # Flatten local data for training.
         flat_advantages = advantages.reshape(-1)
-        flat_prompt_ids = [my_prompt_token_ids[i] for i in range(my_num_prompts) for _ in range(config.rollouts_per_prompt)]
-        flat_response_ids = [my_rollout_ids[i][j] for i in range(my_num_prompts) for j in range(config.rollouts_per_prompt)]
+        flat_prompt_ids = [my_prompt_token_ids[i] for i in range(my_num_prompts) for _ in range(cfg.rollouts_per_prompt)]
+        flat_response_ids = [my_rollout_ids[i][j] for i in range(my_num_prompts) for j in range(cfg.rollouts_per_prompt)]
 
         # --- 5. Skip step if no learning signal (coordinated across all ranks) ---
         local_has_signal = float((flat_advantages != 0).any())
@@ -807,10 +808,10 @@ def main(config: GRPOConfig) -> None:
                 logger.info(
                     "[Step %d/%d] All-zero advantages (reward=%.3f), skipping update.",
                     step,
-                    config.num_steps,
+                    cfg.num_steps,
                     mean_reward,
                 )
-            if config.wandb_enabled and rank == 0:
+            if cfg.wandb_enabled and rank == 0:
                 import wandb
 
                 wandb.log(
@@ -834,22 +835,22 @@ def main(config: GRPOConfig) -> None:
             continue
 
         # Pack local batch into packed rows for efficient forward passes.
-        packed = pack_sequences(flat_prompt_ids, flat_response_ids, config.pack_len, max_seq_len=config.max_model_len)
+        packed = pack_sequences(flat_prompt_ids, flat_response_ids, cfg.pack_len, max_seq_len=cfg.max_model_len)
         avg_pack_len = sum(len(r) for r in packed.row_ids) / packed.num_rows
         if rank == 0:
             logger.info(
                 "[Step %d/%d] Packed %d sequences into %d rows (pack_len=%d, avg_row_len=%.0f)",
                 step,
-                config.num_steps,
+                cfg.num_steps,
                 packed.num_sequences,
                 packed.num_rows,
-                config.pack_len,
+                cfg.pack_len,
                 avg_pack_len,
             )
 
         # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
-        for _iteration in range(config.num_iterations):
+        for _iteration in range(cfg.num_iterations):
             metrics = train_step(
                 policy_model,
                 ref_model,
@@ -857,7 +858,7 @@ def main(config: GRPOConfig) -> None:
                 scheduler,
                 packed,
                 flat_advantages,
-                config,
+                cfg,
             )
         train_time = time.time() - train_start
 
@@ -880,13 +881,13 @@ def main(config: GRPOConfig) -> None:
             **{f"train/{k}": v for k, v in metrics.items()},
         }
 
-        if step % config.log_every == 0 and rank == 0:
+        if step % cfg.log_every == 0 and rank == 0:
             kl_str = f" kl={metrics['kl']:.4f}" if "kl" in metrics else ""
             logger.info(
                 "[Step %d/%d] reward=%.3f correct=%.1f%% len=%.0f grad=%.4f surr=%.4f%s"
                 " ratio=%.3f clip=%.3f trunc=%.1f%% gen=%.1fs train=%.1fs",
                 step,
-                config.num_steps,
+                cfg.num_steps,
                 mean_reward,
                 fraction_correct * 100,
                 completion_log_data["completions/mean_length"],
@@ -900,13 +901,13 @@ def main(config: GRPOConfig) -> None:
                 train_time,
             )
 
-        if config.wandb_enabled and rank == 0:
+        if cfg.wandb_enabled and rank == 0:
             import wandb
 
             wandb.log(log_data)
 
         # --- 9. Checkpoint (rank 0 saves, all ranks wait) ---
-        if step % config.save_every == 0 or step == config.num_steps:
+        if step % cfg.save_every == 0 or step == cfg.num_steps:
             ckpt_dir = output_dir / f"step_{step:04d}"
             if rank == 0:
                 logger.info("Saving checkpoint to %s", ckpt_dir)
@@ -916,9 +917,9 @@ def main(config: GRPOConfig) -> None:
                     shutil.copy2(src, ckpt_dir / src.name)
 
                 # Delete old checkpoints to save disk space.
-                if config.keep_last_n_checkpoints > 0:
+                if cfg.keep_last_n_checkpoints > 0:
                     existing = sorted(output_dir.glob("step_*"))
-                    to_delete = existing[: -config.keep_last_n_checkpoints]
+                    to_delete = existing[: -cfg.keep_last_n_checkpoints]
                     for old_ckpt in to_delete:
                         logger.info("Deleting old checkpoint: %s", old_ckpt)
                         shutil.rmtree(old_ckpt)
@@ -936,7 +937,7 @@ def main(config: GRPOConfig) -> None:
             shutil.copy2(src, final_dir / src.name)
         logger.info("Training complete. Final model saved to %s", final_dir)
 
-    if config.wandb_enabled and rank == 0:
+    if cfg.wandb_enabled and rank == 0:
         import wandb
 
         wandb.finish()
@@ -950,40 +951,7 @@ def main(config: GRPOConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> GRPOConfig:
-    p = argparse.ArgumentParser(description="GRPO training for Ouro")
-    p.add_argument("--model", dest="model_name")
-    p.add_argument("--dataset", dest="dataset_name")
-    p.add_argument("--min-level", type=int, choices=list(range(1, 10)))
-    p.add_argument("--num-steps", type=int)
-    p.add_argument("--prompts-per-step", type=int)
-    p.add_argument("--rollouts-per-prompt", type=int)
-    p.add_argument("--lr", type=float)
-    p.add_argument("--kl-coeff", type=float)
-    p.add_argument("--scale-rewards", choices=["batch", "group", "none"])
-    p.add_argument("--num-iterations", type=int)
-    p.add_argument("--loss-type", choices=["grpo", "cispo"])
-    p.add_argument("--clip-eps", type=float)
-    p.add_argument("--truncation-max", type=float)
-    p.add_argument("--max-new-tokens", type=int)
-    p.add_argument("--max-model-len", type=int)
-    p.add_argument("--fp32-lm-head", dest="fp32_lm_head", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--temperature", type=float)
-    p.add_argument("--enable-interruptions", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--thinking-budget-min", type=int)
-    p.add_argument("--thinking-budget-max", type=int)
-    p.add_argument("--answer-budget", type=int)
-    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--pack-len", type=int)
-    p.add_argument("--output-dir")
-    p.add_argument("--save-every", type=int)
-    p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--wandb", dest="wandb_enabled", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--wandb-run-name", dest="wandb_run_name")
-    p.add_argument("--seed", type=int)
-    args = p.parse_args()
-    return GRPOConfig(**{k: v for k, v in vars(args).items() if v is not None})
-
-
 if __name__ == "__main__":
-    main(parse_args())
+    from jsonargparse import CLI
+
+    main(CLI(GRPOConfig, as_positional=False))

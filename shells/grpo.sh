@@ -13,6 +13,6 @@ NPROC_PER_NODE=${NUM_GPUS:-1}
 
 # Run GRPO training
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE scripts/grpo_train.py \
-    --wandb-run-name "packlen-65k-DeepMath-Level6" \
-    --pack-len 65000 \
+    --wandb_run_name "packlen-65k-DeepMath-Level6" \
+    --pack_len 65000 \
     "$@"
