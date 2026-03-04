@@ -67,6 +67,24 @@ class TestLoadMathTrain:
         assert len(filtered) == 1
         assert filtered["problem"][0] == "Prove that sqrt(2) is irrational."
 
+    def test_max_level_filter(self):
+        """Filtering by difficulty <= max_level (as grpo_train.py does) works correctly."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        filtered = ds.filter(lambda x: x["difficulty"] <= 5)
+        assert len(filtered) == 1
+        assert filtered["problem"][0] == "Find all primes p such that p+2 is also prime."
+
+    def test_min_and_max_level_filter(self):
+        """Combining min_level and max_level narrows to a range."""
+        fake_ds = _make_deepmath_dataset()
+        with patch("ouro_rl.data.load_dataset", return_value=fake_ds):
+            ds = load_math_train()
+        filtered = ds.filter(lambda x: x["difficulty"] >= 5 and x["difficulty"] <= 6)
+        assert len(filtered) == 1
+        assert filtered["problem"][0] == "Find all primes p such that p+2 is also prime."
+
 
 # ---------------------------------------------------------------------------
 # extract_boxed_answer

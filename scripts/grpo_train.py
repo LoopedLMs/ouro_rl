@@ -67,6 +67,7 @@ class GRPOConfig:
     # Dataset
     dataset_name: str = "zwhe99/DeepMath-103K"
     min_level: int | None = 6  # Filter problems by minimum difficulty (DeepMath: 1-9)
+    max_level: int | None = None  # Filter problems by maximum difficulty (DeepMath: 1-9)
     system_prompt: str | None = None  # None = no system prompt (see ouro_rl/data.py for alternatives)
 
     # Training
@@ -102,7 +103,7 @@ class GRPOConfig:
 
     # Memory
     gradient_checkpointing: bool = True  # trade compute for memory (saves ~77 GB activations)
-    pack_len: int = 90000  # max tokens per packed forward pass (controls GPU saturation)
+    pack_len: int = 64000  # max tokens per packed forward pass (controls GPU saturation)
 
     # Logging & checkpointing
     output_dir: str = "outputs/grpo"
@@ -523,6 +524,8 @@ def main(cfg: GRPOConfig) -> None:
     dataset = load_math_train(cfg.dataset_name)
     if cfg.min_level is not None:
         dataset = dataset.filter(lambda x: x["difficulty"] >= cfg.min_level)
+    if cfg.max_level is not None:
+        dataset = dataset.filter(lambda x: x["difficulty"] <= cfg.max_level)
     problems = dataset["problem"]
     solutions = dataset["solution"]
     if rank == 0:
@@ -728,7 +731,7 @@ def main(cfg: GRPOConfig) -> None:
         }
         if cfg.enable_interruptions:
             completion_log_data["completions/interrupted_ratio"] = (
-                n_interrupted / cfg.prompts_per_step * cfg.rollouts_per_prompt
+                n_interrupted / (cfg.prompts_per_step * cfg.rollouts_per_prompt)
             )
             completion_log_data["completions/thinking_budget"] = thinking_budget
         completion_log_data = sync_metrics(completion_log_data, device)
